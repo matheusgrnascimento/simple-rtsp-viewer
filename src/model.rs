@@ -1,0 +1,110 @@
+//! Domain types shared by the other modules.
+
+/// A camera loaded from the Import_File.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Camera {
+    pub rtsp_url: String,     // up to 2048 characters, validated on import
+    pub name: Option<String>, // up to 100 characters, validated on import
+}
+
+/// Connection status of a camera, used by the UI to pick the visual indicator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionStatus {
+    Connected,
+    Disconnected,
+    Reconnecting,
+}
+
+/// Event emitted by a StreamTask to the channel consumed by the UI.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    Frame(CameraFrame),
+    Status(ConnectionStatus),
+}
+
+/// Decoded video frame, already converted to a pixel format egui can use
+/// directly (RGBA8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CameraFrame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Removes the embedded credentials (`user:password@`) from an RTSP URL,
+/// replacing them with `***`, for safe use in logs and messages.
+///
+/// An RTSP_URL may contain embedded basic authentication
+/// (`rtsp://user:password@host/path`); logging the raw URL would leak the
+/// password in plain text. This function keeps the host and path (useful for
+/// diagnostics) and hides only the `userinfo`. URLs without credentials are
+/// returned unchanged.
+pub fn redact_rtsp_credentials(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+
+    // The `authority` runs up to the first '/' after the scheme (or the end of
+    // the string).
+    let authority_end = url[authority_start..]
+        .find('/')
+        .map(|idx| authority_start + idx)
+        .unwrap_or(url.len());
+    let authority = &url[authority_start..authority_end];
+
+    match authority.rfind('@') {
+        Some(at_idx) => {
+            let host_port = &authority[at_idx + 1..];
+            format!(
+                "{}***@{}{}",
+                &url[..authority_start],
+                host_port,
+                &url[authority_end..]
+            )
+        }
+        None => url.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_userinfo_preserving_host_and_path() {
+        assert_eq!(
+            redact_rtsp_credentials("rtsp://user:pass@192.168.1.10:554/stream1"),
+            "rtsp://***@192.168.1.10:554/stream1"
+        );
+    }
+
+    #[test]
+    fn leaves_url_without_credentials_unchanged() {
+        assert_eq!(
+            redact_rtsp_credentials("rtsp://192.168.1.20/stream1"),
+            "rtsp://192.168.1.20/stream1"
+        );
+    }
+
+    #[test]
+    fn at_sign_in_path_is_not_treated_as_credentials() {
+        assert_eq!(
+            redact_rtsp_credentials("rtsp://host/path@x"),
+            "rtsp://host/path@x"
+        );
+    }
+
+    #[test]
+    fn redacts_password_containing_at_sign() {
+        assert_eq!(
+            redact_rtsp_credentials("rtsp://user:p@ss@host/s"),
+            "rtsp://***@host/s"
+        );
+    }
+
+    #[test]
+    fn non_url_string_is_unchanged() {
+        assert_eq!(redact_rtsp_credentials("not a url"), "not a url");
+    }
+}
