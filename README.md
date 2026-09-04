@@ -15,12 +15,12 @@ Simple desktop viewer for watching multiple RTSP cameras in a grid. The project 
 ## Requirements
 
 - stable Rust;
-- FFmpeg 7 with shared libraries and development headers;
-- LLVM/Clang, needed while compiling the FFmpeg bindings.
+- FFmpeg 7.x (tested with 7.1) with shared libraries and development headers;
+- libclang from LLVM 19, used by bindgen while compiling the FFmpeg bindings. `ffmpeg-sys-next` 7.1 uses bindgen 0.70, which generates invalid bindings with recent LLVM releases (LLVM 23, for example, fails).
 
 ### Windows
 
-The `setup.ps1` script installs the required tools with `winget`, downloads a shared FFmpeg build, sets the environment variables and builds the executable in release mode:
+The `setup.ps1` script installs Rust and the Visual Studio Build Tools with `winget`, downloads FFmpeg 7.1 (shared build) and a portable copy of libclang 19 (a download of about 800 MB on the first run, no administrator rights needed), sets the environment variables and builds the executable in release mode:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
@@ -34,7 +34,7 @@ To use tools that are already installed, or to only configure FFmpeg and build:
 
 ## Manual build
 
-With `FFMPEG_DIR`, `LIBCLANG_PATH` and the FFmpeg shared library directory set in the environment:
+With `FFMPEG_DIR`, `LIBCLANG_PATH` (the `bin` folder of an LLVM 19 install, containing `libclang.dll`) and the FFmpeg shared library directory set in the environment:
 
 ```bash
 cargo build --release
