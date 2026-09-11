@@ -5,6 +5,22 @@
 pub struct Camera {
     pub rtsp_url: String,     // up to 2048 characters, validated on import
     pub name: Option<String>, // up to 100 characters, validated on import
+    /// The camera's secondary stream (lower resolution), shown in the grid. The
+    /// main `rtsp_url` is only opened when the camera is enlarged, or always if
+    /// there is no substream. Validated on import like `rtsp_url`.
+    #[serde(default)]
+    pub substream_url: Option<String>,
+}
+
+impl Camera {
+    /// URL to open to show the camera: the main one when it is enlarged (or
+    /// when there is no substream), the substream in the grid.
+    pub fn stream_url(&self, enlarged: bool) -> &str {
+        match (&self.substream_url, enlarged) {
+            (Some(substream), false) => substream,
+            _ => &self.rtsp_url,
+        }
+    }
 }
 
 /// Connection status of a camera, used by the UI to pick the visual indicator.
@@ -106,5 +122,27 @@ mod tests {
     #[test]
     fn non_url_string_is_unchanged() {
         assert_eq!(redact_rtsp_credentials("not a url"), "not a url");
+    }
+
+    #[test]
+    fn stream_url_uses_substream_in_grid_and_main_when_enlarged() {
+        let camera = Camera {
+            rtsp_url: "rtsp://host/main".to_string(),
+            name: None,
+            substream_url: Some("rtsp://host/sub".to_string()),
+        };
+        assert_eq!(camera.stream_url(false), "rtsp://host/sub");
+        assert_eq!(camera.stream_url(true), "rtsp://host/main");
+    }
+
+    #[test]
+    fn stream_url_without_substream_is_always_main() {
+        let camera = Camera {
+            rtsp_url: "rtsp://host/main".to_string(),
+            name: None,
+            substream_url: None,
+        };
+        assert_eq!(camera.stream_url(false), "rtsp://host/main");
+        assert_eq!(camera.stream_url(true), "rtsp://host/main");
     }
 }

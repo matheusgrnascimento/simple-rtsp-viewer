@@ -454,6 +454,7 @@ mod tests {
         Camera {
             rtsp_url: url.to_string(),
             name: None,
+            substream_url: None,
         }
     }
 

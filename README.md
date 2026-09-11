@@ -42,7 +42,7 @@ cargo build --release
 
 ## Camera configuration
 
-Create a JSON file with a list of cameras. The `url` field is required and `name` is optional:
+Create a JSON file with a list of cameras. The `url` field is required; `name` and `substream_url` are optional:
 
 ```json
 [
@@ -51,6 +51,7 @@ Create a JSON file with a list of cameras. The `url` field is required and `name
     "name": "Front door"
   },
   {
+    "substream_url": "rtsp://user:password@192.168.1.10:554/stream2",
     "url": "rtsp://192.168.1.20/stream1",
     "name": "Garage"
   }
@@ -60,6 +61,8 @@ Create a JSON file with a list of cameras. The `url` field is required and `name
 The `cameras.json` file is ignored by Git to avoid accidentally committing real addresses and credentials.
 
 ## Running
+`substream_url` points to the camera's secondary stream, which has a lower resolution (on TP-Link Tapo cameras, for example, `stream1` is the main stream and `stream2` the secondary one). The grid uses it, which cuts CPU and network usage considerably; the main stream is only opened when the camera is enlarged. Without `substream_url`, the camera always uses `url`. An invalid `substream_url` is ignored without dropping the camera.
+
 
 Pass the camera file as the first argument:
 

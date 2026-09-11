@@ -174,6 +174,7 @@ mod tests {
         Camera {
             rtsp_url: url.to_string(),
             name: None,
+            substream_url: None,
         }
     }
 
@@ -280,8 +281,9 @@ mod tests {
         fn property_camera_roundtrip(
             url in "[^\"\\\\]{1,40}",
             name in proptest::option::of("[^\"\\\\]{0,30}"),
+            substream_url in proptest::option::of("[^\"\\\\]{1,40}"),
         ) {
-            let camera = Camera { rtsp_url: url, name };
+            let camera = Camera { rtsp_url: url, name, substream_url };
             let json = serde_json::to_string(&camera).unwrap();
             let back: Camera = serde_json::from_str(&json).unwrap();
             prop_assert_eq!(camera, back);

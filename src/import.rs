@@ -19,6 +19,7 @@ const MAX_CAMERAS: usize = 64;
 pub struct ImportedEntry {
     pub raw_url: String,
     pub raw_name: Option<String>,
+    pub raw_substream_url: Option<String>,
 }
 
 /// Result of validating/importing a list of `ImportedEntry`.
@@ -145,10 +146,25 @@ pub fn validate_and_import(entries: &[ImportedEntry]) -> ImportOutcome {
             _ => None,
         };
 
+        // An invalid substream (or one equal to the main URL) is ignored
+        // without dropping the camera: it then uses only the main URL.
+        let substream_url = match &entry.raw_substream_url {
+            Some(sub) if is_valid_rtsp_url(sub) && sub != &entry.raw_url => Some(sub.clone()),
+            Some(sub) if sub != &entry.raw_url => {
+                tracing::warn!(
+                    rtsp_url = %crate::model::redact_rtsp_credentials(&entry.raw_url),
+                    "invalid substream_url ignored; the camera will use only the main URL"
+                );
+                None
+            }
+            _ => None,
+        };
+
         if cameras.len() < MAX_CAMERAS {
             cameras.push(Camera {
                 rtsp_url: entry.raw_url.clone(),
                 name,
+                substream_url,
             });
         }
     }
@@ -169,6 +185,8 @@ struct RawImportEntry {
     url: String,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    substream_url: Option<String>,
 }
 
 impl From<RawImportEntry> for ImportedEntry {
@@ -176,6 +194,7 @@ impl From<RawImportEntry> for ImportedEntry {
         ImportedEntry {
             raw_url: raw.url,
             raw_name: raw.name,
+            raw_substream_url: raw.substream_url,
         }
     }
 }
@@ -252,7 +271,60 @@ mod tests {
         ImportedEntry {
             raw_url: url.to_string(),
             raw_name: name.map(str::to_string),
+            raw_substream_url: None,
         }
+    }
+
+    fn entry_with_substream(url: &str, substream: &str) -> ImportedEntry {
+        ImportedEntry {
+            raw_substream_url: Some(substream.to_string()),
+            ..entry(url, None)
+        }
+    }
+
+    #[test]
+    fn valid_substream_is_kept() {
+        let outcome = validate_and_import(&[entry_with_substream(
+            "rtsp://192.168.1.10/stream1",
+            "rtsp://192.168.1.10/stream2",
+        )]);
+        assert_eq!(
+            outcome.cameras[0].substream_url,
+            Some("rtsp://192.168.1.10/stream2".to_string())
+        );
+    }
+
+    #[test]
+    fn invalid_substream_is_dropped_but_camera_kept() {
+        let outcome = validate_and_import(&[entry_with_substream(
+            "rtsp://192.168.1.10/stream1",
+            "http://192.168.1.10/stream2",
+        )]);
+        assert_eq!(outcome.cameras.len(), 1);
+        assert_eq!(outcome.rejected_count, 0);
+        assert_eq!(outcome.cameras[0].substream_url, None);
+    }
+
+    #[test]
+    fn substream_equal_to_main_url_is_dropped() {
+        let outcome = validate_and_import(&[entry_with_substream(
+            "rtsp://192.168.1.10/stream1",
+            "rtsp://192.168.1.10/stream1",
+        )]);
+        assert_eq!(outcome.cameras[0].substream_url, None);
+    }
+
+    #[test]
+    fn load_import_file_reads_substream_url() {
+        let path = write_temp_file(
+            r#"[{"url": "rtsp://192.168.1.10/stream1", "substream_url": "rtsp://192.168.1.10/stream2"}]"#,
+        );
+        let outcome = load_import_file(&path).unwrap();
+        assert_eq!(
+            outcome.cameras[0].substream_url,
+            Some("rtsp://192.168.1.10/stream2".to_string())
+        );
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -425,6 +497,7 @@ mod tests {
                 .map(|(u, n)| ImportedEntry {
                     raw_url: u.clone(),
                     raw_name: n.clone(),
+                    raw_substream_url: None,
                 })
                 .collect();
             let outcome = validate_and_import(&entries);
