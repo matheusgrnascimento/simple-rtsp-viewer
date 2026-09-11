@@ -50,9 +50,9 @@ fn show_import_error(err: &import::ImportError) {
         .show();
 }
 
-/// Shows the user how many cameras were loaded and rejected at the end of the
-/// import, including a warning if the maximum number of cameras was reached
-/// (Requirements 1.5, 1.6, 1.7).
+/// Warns the user when the import had problems: no valid camera, rejected
+/// entries or the maximum number of cameras reached (Requirements 1.5, 1.6,
+/// 1.7). A clean import opens no warning; the summary only goes to the log.
 fn show_import_summary(outcome: &import::ImportOutcome) {
     if outcome.cameras.is_empty() {
         rfd::MessageDialog::new()
@@ -68,20 +68,24 @@ fn show_import_summary(outcome: &import::ImportOutcome) {
         outcome.cameras.len(),
         outcome.rejected_count
     );
+    if outcome.rejected_count == 0 && !outcome.truncated {
+        return;
+    }
+
     if outcome.truncated {
         description.push_str("\nMaximum of 64 cameras reached: extra valid entries were ignored.");
     }
 
     rfd::MessageDialog::new()
-        .set_title("Import finished")
+        .set_title("Import finished with warnings")
         .set_description(&description)
-        .set_level(rfd::MessageLevel::Info)
+        .set_level(rfd::MessageLevel::Warning)
         .show();
 }
 
 /// Loads the Import_File selected by `pick_import_file`, showing an error
-/// message with the specific cause on failure (Requirement 1.3) and the summary
-/// of loaded/rejected cameras on success (Requirements 1.5, 1.6, 1.7). If the
+/// message with the specific cause on failure (Requirement 1.3) and a warning
+/// when entries were rejected or ignored (Requirements 1.5, 1.6, 1.7). If the
 /// user cancels the file selection, or if the import fails, returns an empty
 /// camera list (equivalent to keeping the previously loaded list unchanged,
 /// which is still empty at this startup stage).
