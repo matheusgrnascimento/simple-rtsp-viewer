@@ -23,19 +23,22 @@ impl Camera {
     }
 }
 
+/// Maximum size, in physical pixels, at which the UI shows a camera's video.
+/// The StreamTask scales each frame down to fit it, keeping the aspect ratio,
+/// before converting it to RGBA, so it does not convert and send pixels the
+/// screen would not show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplaySize {
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Connection status of a camera, used by the UI to pick the visual indicator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionStatus {
     Connected,
     Disconnected,
     Reconnecting,
-}
-
-/// Event emitted by a StreamTask to the channel consumed by the UI.
-#[derive(Debug, Clone)]
-pub enum StreamEvent {
-    Frame(CameraFrame),
-    Status(ConnectionStatus),
 }
 
 /// Decoded video frame, already converted to a pixel format egui can use

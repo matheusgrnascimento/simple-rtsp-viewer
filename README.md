@@ -9,6 +9,9 @@ Simple desktop viewer for watching multiple RTSP cameras in a grid. The project 
 - visual indicators for connected, reconnecting and failed streams;
 - automatic reconnection with progressive backoff when a stream drops;
 - camera reordering by drag and drop;
+- double-click to enlarge a camera (double-click or `Esc` returns to the grid);
+- substream (lower resolution) in the grid, main stream only for the enlarged camera;
+- frames scaled down to their on-screen size during decoding, keeping the aspect ratio;
 - automatic persistence of the grid order in `layout.json`;
 - support for RTSP URLs with authentication, without exposing credentials in the logs.
 
@@ -48,21 +51,21 @@ Create a JSON file with a list of cameras. The `url` field is required; `name` a
 [
   {
     "url": "rtsp://user:password@192.168.1.10:554/stream1",
+    "substream_url": "rtsp://user:password@192.168.1.10:554/stream2",
     "name": "Front door"
   },
   {
-    "substream_url": "rtsp://user:password@192.168.1.10:554/stream2",
     "url": "rtsp://192.168.1.20/stream1",
     "name": "Garage"
   }
 ]
 ```
 
+`substream_url` points to the camera's secondary stream, which has a lower resolution (on TP-Link Tapo cameras, for example, `stream1` is the main stream and `stream2` the secondary one). The grid uses it, which cuts CPU and network usage considerably; the main stream is only opened when the camera is enlarged. Without `substream_url`, the camera always uses `url`. An invalid `substream_url` is ignored without dropping the camera.
+
 The `cameras.json` file is ignored by Git to avoid accidentally committing real addresses and credentials.
 
 ## Running
-`substream_url` points to the camera's secondary stream, which has a lower resolution (on TP-Link Tapo cameras, for example, `stream1` is the main stream and `stream2` the secondary one). The grid uses it, which cuts CPU and network usage considerably; the main stream is only opened when the camera is enlarged. Without `substream_url`, the camera always uses `url`. An invalid `substream_url` is ignored without dropping the camera.
-
 
 Pass the camera file as the first argument:
 
