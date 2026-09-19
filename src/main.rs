@@ -6,9 +6,14 @@ mod streaming;
 mod ui;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use streaming::StreamManagerHandle;
 use ui::SimpleRtspViewerApp;
+
+/// Maximum time the shutdown waits for the camera threads (and a layout write
+/// that may be in progress) to finish before abandoning them.
+const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
 /// Path of the Layout_Config_File kept by the System (Requirement 5).
 ///
@@ -63,15 +68,15 @@ fn show_import_summary(outcome: &import::ImportOutcome) {
         return;
     }
 
+    if outcome.rejected_count == 0 && !outcome.truncated {
+        return;
+    }
+
     let mut description = format!(
         "{} camera(s) loaded.\n{} entry(ies) rejected.",
         outcome.cameras.len(),
         outcome.rejected_count
     );
-    if outcome.rejected_count == 0 && !outcome.truncated {
-        return;
-    }
-
     if outcome.truncated {
         description.push_str("\nMaximum of 64 cameras reached: extra valid entries were ignored.");
     }
@@ -162,7 +167,7 @@ fn main() -> eframe::Result {
     // active (through `enter`) for the whole run of `eframe::run_native`, which
     // runs the UI event loop blocking on the main thread.
     let runtime = tokio::runtime::Runtime::new().expect("failed to initialize the tokio runtime");
-    let _runtime_guard = runtime.enter();
+    let runtime_guard = runtime.enter();
 
     let stream_manager_handle = StreamManagerHandle::new();
     let shutdown_handle = stream_manager_handle.clone();
@@ -183,8 +188,17 @@ fn main() -> eframe::Result {
 
     // System shutdown: tells the Stream_Manager to stop (without reconnecting)
     // every running StreamTask and release its resources before the process
-    // ends (Requirements 3.6, 6.6).
+    // ends (Requirements 3.6, 6.6). `shutdown` only returns after every
+    // cancellation has been signaled.
     runtime.block_on(shutdown_handle.shutdown());
+
+    // Shuts the runtime down with a deadline. Dropping the runtime would wait
+    // without limit for the `spawn_blocking` threads, and a StreamTask stuck in
+    // network I/O (a connection hung until FFmpeg's socket timeout) would hold
+    // up closing the app. After the deadline, the remaining threads are
+    // abandoned and the process exits normally.
+    drop(runtime_guard);
+    runtime.shutdown_timeout(SHUTDOWN_GRACE_PERIOD);
 
     run_result
 }
