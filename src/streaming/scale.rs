@@ -7,13 +7,19 @@ use crate::model::DisplaySize;
 /// that fits in `display`, never enlarging the source (if the tile is larger
 /// than the video, the GPU scales it up when drawing).
 ///
-/// `None` or zero sizes keep the source resolution.
+/// The width comes out as a multiple of 4 (from 4 pixels up): each RGBA row is
+/// then a multiple of 16 bytes, the alignment swscale needs to use its
+/// vectorized routines. Without it, swscale falls back to a slower path and
+/// prints a warning to the console. A difference of up to 3 pixels in width is
+/// not visible.
+///
+/// `None` or zero sizes keep the source resolution (with the width aligned).
 pub fn output_size(
     source_width: u32,
     source_height: u32,
     display: Option<DisplaySize>,
 ) -> (u32, u32) {
-    let source = (source_width, source_height);
+    let source = (align_width(source_width), source_height);
     let Some(display) = display else {
         return source;
     };
@@ -28,7 +34,20 @@ pub fn output_size(
         .min(f64::from(display.height) / f64::from(source_height));
     let width = (f64::from(source_width) * scale).round() as u32;
     let height = (f64::from(source_height) * scale).round() as u32;
-    (width.clamp(1, source_width), height.clamp(1, source_height))
+    (
+        align_width(width.clamp(1, source_width)),
+        height.clamp(1, source_height),
+    )
+}
+
+/// Rounds the width down to a multiple of 4, without going below 4 (and without
+/// touching widths smaller than that).
+fn align_width(width: u32) -> u32 {
+    if width < 4 {
+        width
+    } else {
+        width / 4 * 4
+    }
 }
 
 #[cfg(test)]
@@ -55,6 +74,14 @@ mod tests {
     }
 
     #[test]
+    fn width_is_aligned_to_four_pixels() {
+        // 1000x562 (16:9) limited to a width of 637 -> 637 becomes 636.
+        assert_eq!(output_size(1000, 562, display(637, 1000)), (636, 358));
+        // Source with an odd width and no scaling: only the width is aligned.
+        assert_eq!(output_size(1281, 720, None), (1280, 720));
+    }
+
+    #[test]
     fn unknown_or_empty_display_keeps_source_size() {
         assert_eq!(output_size(2560, 1440, None), (2560, 1440));
         assert_eq!(output_size(2560, 1440, display(0, 480)), (2560, 1440));
@@ -78,20 +105,25 @@ mod tests {
 
             prop_assert!(width >= 1 && height >= 1);
             prop_assert!(width <= source_width && height <= source_height);
+            prop_assert_eq!(width % 4, 0);
 
             let fits = source_width <= display_width && source_height <= display_height;
             if fits {
-                prop_assert_eq!((width, height), (source_width, source_height));
+                prop_assert_eq!((width, height), (source_width / 4 * 4, source_height));
             } else {
                 prop_assert!(width <= display_width && height <= display_height);
-                prop_assert!(width == display_width || height == display_height);
+                // The width may have lost up to 3 pixels to the alignment.
+                prop_assert!(width + 3 >= display_width || height == display_height);
             }
 
-            // |w/h - sw/sh| expressed without division: each dimension is off
-            // by at most 1 pixel (rounding, or the 1 pixel minimum).
+            // |w/h - sw/sh| expressed without division: the height is off by at
+            // most 1 pixel (rounding) and the width by up to 4 (rounding plus
+            // alignment).
             let cross_error = (u64::from(width) * u64::from(source_height))
                 .abs_diff(u64::from(height) * u64::from(source_width));
-            prop_assert!(cross_error <= u64::from(source_width) + u64::from(source_height));
+            prop_assert!(
+                cross_error <= 4 * u64::from(source_height) + u64::from(source_width)
+            );
         }
     }
 }
