@@ -17,3 +17,7 @@ rfd = "0.17.2"
 
 [dev-dependencies]
 proptest = "1"
+
+[profile.release]
+# Cross-crate optimization (egui, epaint, tokio...) in the final executable.
+lto = "thin"
