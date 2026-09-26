@@ -32,6 +32,23 @@ use super::state::{
 /// available right now), avoiding a busy loop on the camera thread.
 const EAGAIN_RETRY_DELAY: Duration = Duration::from_millis(10);
 
+/// Environment variable that turns GPU decoding off when set to `0`, `false` or
+/// `off` (useful to compare CPU usage or to work around a faulty driver).
+pub const GPU_DECODING_ENV: &str = "RTSP_VIEWER_GPU_DECODE";
+
+/// Video packets accepted by the GPU without producing any frame before giving
+/// up on it. A camera sends a keyframe every few seconds; 150 packets (~7 to 10
+/// s at 15–20 fps) is enough headroom for that.
+const GPU_FIRST_FRAME_PACKET_LIMIT: u32 = 150;
+
+/// GPU decoding on, unless `GPU_DECODING_ENV` turns it off.
+fn gpu_decoding_enabled() -> bool {
+    !matches!(
+        std::env::var(GPU_DECODING_ENV).as_deref().map(str::trim),
+        Ok("0" | "false" | "off")
+    )
+}
+
 /// Channels a `StreamTask` uses to talk to the UI.
 pub struct StreamChannels {
     /// Decoded frames (dropped when the channel is full).
@@ -174,6 +191,9 @@ async fn run_manager_loop(mut commands: mpsc::UnboundedReceiver<StreamCommand>) 
 fn run_stream_task(rtsp_url: String, channels: StreamChannels, cancel_token: CancellationToken) {
     let mut status = ConnectionStatus::Disconnected;
     let mut attempt: u32 = 0;
+    // Starts by trying to decode on the GPU; `decode_stream` turns the GPU off
+    // for the next attempts of this stream if it fails.
+    let mut use_gpu = gpu_decoding_enabled();
 
     loop {
         if cancel_token.is_cancelled() {
@@ -186,6 +206,7 @@ fn run_stream_task(rtsp_url: String, channels: StreamChannels, cancel_token: Can
             &cancel_token,
             &mut status,
             &mut attempt,
+            &mut use_gpu,
         ) {
             StopReason::Cancelled => {
                 // Shutdown requested (removal/shutdown): no transition to
@@ -319,6 +340,11 @@ fn wait_or_cancelled(delay: Duration, cancel_token: &CancellationToken) -> bool 
 /// `status` to Connected, publishes it to `channels.status` and resets `attempt`
 /// (Requirement 6.4).
 ///
+/// With `use_gpu`, decoding goes to the GPU (D3D11VA) when FFmpeg and the driver
+/// support the video; otherwise FFmpeg itself carries on with the CPU. If the GPU
+/// fails before the first frame, `use_gpu` is turned off and the next attempts of
+/// this stream use only the CPU.
+///
 /// The status does not go through the frame channel: if it shared a small channel
 /// with frames using `try_send`, a status change that happened while the channel
 /// was full would be dropped and the UI would show the wrong indicator until the
@@ -339,6 +365,7 @@ fn decode_stream(
     cancel_token: &CancellationToken,
     status: &mut ConnectionStatus,
     attempt: &mut u32,
+    use_gpu: &mut bool,
 ) -> StopReason {
     // URL without credentials for logging (avoids leaking the username/password
     // embedded in the RTSP_URL in plain text).
@@ -379,11 +406,12 @@ fn decode_stream(
         stream.index()
     };
 
+    let mut gpu_attached = false;
     let mut decoder = {
         let stream = input_ctx
             .stream(video_stream_index)
             .expect("valid stream index");
-        let context_decoder = match ffmpeg_next::codec::context::Context::from_parameters(
+        let mut context_decoder = match ffmpeg_next::codec::context::Context::from_parameters(
             stream.parameters(),
         ) {
             Ok(ctx) => ctx,
@@ -392,6 +420,15 @@ fn decode_stream(
                 return StopReason::Failure;
             }
         };
+        if *use_gpu {
+            gpu_attached = attach_gpu_device(&mut context_decoder);
+            if !gpu_attached {
+                // No D3D11 device (Windows without support, driver or another
+                // system): no point in trying again on every reconnection.
+                tracing::warn!(rtsp_url = %safe_url, "GPU unavailable for decoding; using the CPU");
+                *use_gpu = false;
+            }
+        }
         match context_decoder.decoder().video() {
             Ok(decoder) => decoder,
             Err(err) => {
@@ -404,6 +441,12 @@ fn decode_stream(
     // Current pixel converter and the configuration it was created for: source
     // format and size, output size.
     let mut scaler: Option<(ScalerConfig, ffmpeg_next::software::scaling::Context)> = None;
+    // Decoded frame and, when it is in GPU memory, its copy in system memory.
+    // Reused for every frame.
+    let mut decoded = ffmpeg_next::util::frame::video::Video::empty();
+    let mut downloaded = ffmpeg_next::util::frame::video::Video::empty();
+    let mut decoded_any = false;
+    let mut packets_without_frame: u32 = 0;
 
     loop {
         if cancel_token.is_cancelled() {
@@ -445,37 +488,70 @@ fn decode_stream(
         }
 
         if let Err(err) = decoder.send_packet(&packet) {
+            if gpu_attached && !decoded_any {
+                tracing::warn!(rtsp_url = %safe_url, "the GPU refused the video; the next attempts will use the CPU");
+                *use_gpu = false;
+            }
             tracing::error!(rtsp_url = %safe_url, error = %err, "failed to send a packet to the decoder");
             return StopReason::Failure;
         }
 
-        let mut decoded = ffmpeg_next::util::frame::video::Video::empty();
         while decoder.receive_frame(&mut decoded).is_ok() {
             if cancel_token.is_cancelled() {
                 return StopReason::Cancelled;
             }
 
+            if !decoded_any {
+                decoded_any = true;
+                let on_gpu = is_hardware_frame(&decoded);
+                tracing::info!(
+                    rtsp_url = %safe_url,
+                    decoder = if on_gpu { "GPU (D3D11VA)" } else { "CPU" },
+                    "first frame decoded"
+                );
+            }
+
+            if *status != ConnectionStatus::Connected {
+                *status = next_connection_state(*status, ConnectionEvent::FirstFrameDecoded);
+                *attempt = 0;
+                channels.status.send_replace(*status);
+            }
+
+            // Channel full: the UI has not shown the previous frame yet. This
+            // one is dropped right here, before the GPU download and the RGBA
+            // conversion, which are the most expensive work after decoding.
+            if channels.frames.capacity() == 0 {
+                continue;
+            }
+
+            let source = if is_hardware_frame(&decoded) {
+                if !download_hardware_frame(&decoded, &mut downloaded) {
+                    tracing::warn!(rtsp_url = %safe_url, "failed to copy the frame from the GPU; the next attempts will use the CPU");
+                    *use_gpu = false;
+                    return StopReason::Failure;
+                }
+                &downloaded
+            } else {
+                &decoded
+            };
+
             // Scales the frame down to the size the UI will show it at during
             // the RGBA conversion: converting and copying a 2560x1440 frame to
             // show it in a 600x340 tile would waste ~94% of the work.
             let (out_width, out_height) = output_size(
-                decoded.width(),
-                decoded.height(),
+                source.width(),
+                source.height(),
                 *channels.display_size.borrow(),
             );
+            // The color range comes from the decoded frame: the GPU copy does
+            // not carry that metadata.
             let (source_format, full_range) =
-                normalize_source_format(decoded.format(), decoded.color_range());
-            // The "yuvj*" format and the equivalent "yuv*" one have the same
-            // memory layout; the frame is only relabeled to match the
-            // converter.
-            if source_format != decoded.format() {
-                decoded.set_format(source_format);
-            }
+                normalize_source_format(source.format(), decoded.color_range());
             let config = ScalerConfig {
                 source_format,
                 full_range,
-                source_width: decoded.width(),
-                source_height: decoded.height(),
+                source_width: source.width(),
+                source_height: source.height(),
                 out_width,
                 out_height,
             };
@@ -507,50 +583,129 @@ fn decode_stream(
             }
             let (_, scaler_ctx) = scaler.as_mut().expect("converter created right above");
 
-            let mut rgba_frame = ffmpeg_next::util::frame::video::Video::empty();
-            if let Err(err) = scaler_ctx.run(&decoded, &mut rgba_frame) {
-                tracing::error!(rtsp_url = %safe_url, error = %err, "failed to convert the frame to RGBA8");
+            let Some(image) = scale_into_image(scaler_ctx, source, out_width, out_height) else {
+                tracing::error!(rtsp_url = %safe_url, "failed to convert the frame to RGBA8");
                 return StopReason::Failure;
-            }
-
-            let width = rgba_frame.width();
-            let height = rgba_frame.height();
-            let rgba = copy_rgba_plane(&rgba_frame, width, height);
-
-            if *status != ConnectionStatus::Connected {
-                *status = next_connection_state(*status, ConnectionEvent::FirstFrameDecoded);
-                *attempt = 0;
-                channels.status.send_replace(*status);
-            }
+            };
 
             // Drop policy for the oldest frame: see the note in this function's docs.
-            let _ = channels.frames.try_send(CameraFrame {
-                width,
-                height,
-                rgba,
-            });
+            let _ = channels.frames.try_send(image);
+        }
+
+        // The GPU accepts the packets but returns no frames (a profile or
+        // resolution the driver does not decode): reconnect using the CPU.
+        if !decoded_any {
+            packets_without_frame += 1;
+            if gpu_attached && packets_without_frame > GPU_FIRST_FRAME_PACKET_LIMIT {
+                tracing::warn!(rtsp_url = %safe_url, "the GPU produced no frames; the next attempts will use the CPU");
+                *use_gpu = false;
+                return StopReason::Failure;
+            }
         }
     }
 }
 
-/// Copies the RGBA8 pixel plane of `frame` into a compact `Vec<u8>` (without
-/// stride padding), in the layout `CameraFrame` expects (row by row, `width *
-/// 4` bytes per row, `height` rows).
-fn copy_rgba_plane(
+/// Turns on GPU decoding in the decoder context, not opened yet, by creating a
+/// D3D11VA device. With the device present, FFmpeg picks the GPU format on its
+/// own when the video is supported and falls back to the CPU when it is not.
+/// Returns `false` if the device could not be created.
+fn attach_gpu_device(context: &mut ffmpeg_next::codec::context::Context) -> bool {
+    use ffmpeg_next::ffi;
+
+    let mut device: *mut ffi::AVBufferRef = std::ptr::null_mut();
+    // SAFETY: `context` is a valid `AVCodecContext` that is not open yet. The
+    // reference created by `av_hwdevice_ctx_create` becomes owned by the
+    // context, which releases it in `avcodec_free_context`.
+    unsafe {
+        let created = ffi::av_hwdevice_ctx_create(
+            &mut device,
+            ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+        );
+        if created < 0 || device.is_null() {
+            return false;
+        }
+        (*context.as_mut_ptr()).hw_device_ctx = device;
+    }
+    true
+}
+
+/// The frame is in GPU memory (and must be copied before converting).
+fn is_hardware_frame(frame: &ffmpeg_next::util::frame::video::Video) -> bool {
+    // SAFETY: reads a field of a valid `AVFrame`.
+    unsafe { !(*frame.as_ptr()).hw_frames_ctx.is_null() }
+}
+
+/// Copies a frame from GPU memory to `target`, in system memory (usually in
+/// NV12), reusing `target` across frames.
+fn download_hardware_frame(
+    hardware: &ffmpeg_next::util::frame::video::Video,
+    target: &mut ffmpeg_next::util::frame::video::Video,
+) -> bool {
+    // SAFETY: two valid `AVFrame`s; `av_frame_unref` releases the previous
+    // content of `target` before `av_hwframe_transfer_data` allocates the new
+    // one.
+    unsafe {
+        ffmpeg_next::ffi::av_frame_unref(target.as_mut_ptr());
+        ffmpeg_next::ffi::av_hwframe_transfer_data(target.as_mut_ptr(), hardware.as_ptr(), 0) >= 0
+    }
+}
+
+/// Converts `frame` to RGBA at `width`x`height`, writing straight into the egui
+/// image buffer: no intermediate RGBA frame, no copy to strip the row padding
+/// and no pixel conversion on the UI thread.
+fn scale_into_image(
+    scaler: &mut ffmpeg_next::software::scaling::Context,
     frame: &ffmpeg_next::util::frame::video::Video,
     width: u32,
     height: u32,
-) -> Vec<u8> {
-    let row_bytes = width as usize * 4;
-    let stride = frame.stride(0);
-    let data = frame.data(0);
+) -> Option<CameraFrame> {
+    use std::ffi::c_int;
 
-    let mut rgba = Vec::with_capacity(row_bytes * height as usize);
-    for row in 0..height as usize {
-        let start = row * stride;
-        rgba.extend_from_slice(&data[start..start + row_bytes]);
+    let (columns, rows) = (width as usize, height as usize);
+    let pixel_count = columns.checked_mul(rows)?;
+    let mut pixels: Vec<egui::Color32> = Vec::with_capacity(pixel_count);
+    let row_bytes = c_int::try_from(columns.checked_mul(4)?).ok()?;
+    let expected_rows = c_int::try_from(rows).ok()?;
+
+    let destination: [*mut u8; 4] = [
+        pixels.as_mut_ptr().cast::<u8>(),
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    ];
+    let destination_stride: [c_int; 4] = [row_bytes, 0, 0, 0];
+
+    // SAFETY: the converter was created for the format and size of `frame` and
+    // for RGBA output of `width`x`height` (see `ScalerConfig`). The destination
+    // has capacity for exactly `width * height` 4-byte pixels (`Color32` is
+    // `[u8; 4]` in RGBA order), with rows of `width * 4` bytes.
+    let written_rows = unsafe {
+        let source = frame.as_ptr();
+        ffmpeg_next::ffi::sws_scale(
+            scaler.as_mut_ptr(),
+            (*source).data.as_ptr().cast::<*const u8>(),
+            (*source).linesize.as_ptr(),
+            0,
+            (*source).height,
+            destination.as_ptr(),
+            destination_stride.as_ptr(),
+        )
+    };
+    if written_rows != expected_rows {
+        return None;
     }
-    rgba
+
+    // SAFETY: the `sws_scale` above wrote all `rows` complete rows,
+    // initializing the `pixel_count` pixels. RGBA output from a YUV source has
+    // alpha 255, so the pixels are already in `Color32`'s premultiplied format.
+    unsafe { pixels.set_len(pixel_count) };
+    Some(egui::ColorImage {
+        size: [columns, rows],
+        pixels,
+    })
 }
 
 #[cfg(test)]
@@ -575,11 +730,7 @@ mod tests {
     fn full_frame_channel() -> (mpsc::Sender<CameraFrame>, mpsc::Receiver<CameraFrame>) {
         let (frame_tx, frame_rx) = mpsc::channel(1);
         frame_tx
-            .try_send(CameraFrame {
-                width: 0,
-                height: 0,
-                rgba: Vec::new(),
-            })
+            .try_send(CameraFrame::new([1, 1], egui::Color32::BLACK))
             .expect("a newly created channel has room for one frame");
         (frame_tx, frame_rx)
     }

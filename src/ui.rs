@@ -22,13 +22,13 @@ use crate::layout;
 use crate::model::{Camera, CameraFrame, ConnectionStatus, DisplaySize};
 use crate::streaming::{StreamChannels, StreamManagerHandle};
 
-/// Capacity of each camera's frame channel (`CameraFrame`). Small on purpose:
-/// only the latest frame matters to the UI, which drains the channel completely
-/// on every render frame. The matching `StreamTask` uses `try_send`; when the
-/// channel is full (UI momentarily slower than decoding), the newly decoded
-/// frame is dropped, limiting memory use to a few frames per camera
-/// (Requirement 7.2, see design.md).
-const FRAME_CHANNEL_CAPACITY: usize = 2;
+/// Capacity of each camera's frame channel (`CameraFrame`). A single frame:
+/// only the latest one matters to the UI, which drains the channel on every
+/// render frame. While the previous frame has not been consumed, the
+/// `StreamTask` drops new ones even before converting them to RGBA, without
+/// spending CPU on frames that would not be shown (Requirement 7.2, see
+/// design.md).
+const FRAME_CHANNEL_CAPACITY: usize = 1;
 
 /// Step, in pixels, by which the display size reported to the `StreamTask`s is
 /// rounded up. Without it, dragging the window border would change the size on
@@ -282,9 +282,16 @@ impl SimpleRtspViewerApp {
                 continue;
             };
 
+            // Only the latest frame becomes a texture; uploading to the GPU
+            // frames that would be replaced within the same screen frame would
+            // be wasted work.
+            let mut newest = None;
             while let Ok(frame) = stream.frames.try_recv() {
+                newest = Some(frame);
+            }
+            if let Some(frame) = newest {
                 received_any = true;
-                Self::update_texture(&mut self.textures, ctx, key, &frame);
+                Self::update_texture(&mut self.textures, ctx, key, frame);
             }
 
             // Compares with the last value read: works the same before and
@@ -298,28 +305,19 @@ impl SimpleRtspViewerApp {
         received_any
     }
 
-    /// Converts a `CameraFrame` (RGBA8) into an `egui::ColorImage` and updates
-    /// (or creates) the matching `egui::TextureHandle`, reusing the existing
-    /// texture through `TextureHandle::set` when possible.
+    /// Updates (or creates) the camera's `egui::TextureHandle` with the frame.
+    /// The frame already arrives in egui's format and is moved into the
+    /// texture, without a copy.
     fn update_texture(
         textures: &mut HashMap<String, egui::TextureHandle>,
         ctx: &egui::Context,
         url: &str,
-        frame: &CameraFrame,
+        frame: CameraFrame,
     ) {
-        let color_image = egui::ColorImage::from_rgba_unmultiplied(
-            [frame.width as usize, frame.height as usize],
-            &frame.rgba,
-        );
-
         if let Some(texture) = textures.get_mut(url) {
-            texture.set(color_image, egui::TextureOptions::default());
+            texture.set(frame, egui::TextureOptions::LINEAR);
         } else {
-            let texture = ctx.load_texture(
-                url.to_string(),
-                color_image,
-                egui::TextureOptions::default(),
-            );
+            let texture = ctx.load_texture(url.to_string(), frame, egui::TextureOptions::LINEAR);
             textures.insert(url.to_string(), texture);
         }
     }

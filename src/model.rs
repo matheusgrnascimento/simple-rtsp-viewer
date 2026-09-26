@@ -41,14 +41,11 @@ pub enum ConnectionStatus {
     Reconnecting,
 }
 
-/// Decoded video frame, already converted to a pixel format egui can use
-/// directly (RGBA8).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CameraFrame {
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Vec<u8>,
-}
+/// Decoded video frame, already at display size and in egui's image format
+/// (RGBA, alpha 255). The pixel converter writes straight into this image's
+/// buffer, which becomes a texture without any copy or conversion on the UI
+/// thread.
+pub type CameraFrame = egui::ColorImage;
 
 /// Removes the embedded credentials (`user:password@`) from an RTSP URL,
 /// replacing them with `***`, for safe use in logs and messages.
