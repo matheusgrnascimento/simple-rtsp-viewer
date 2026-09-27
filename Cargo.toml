@@ -14,6 +14,13 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rfd = "0.17.2"
+# Windows 11 Mica backdrop (on Windows 10 and other systems the call simply
+# fails and the window uses a solid background).
+window-vibrancy = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+# Reads the Windows accent color from the registry.
+winreg = "0.56"
 
 [dev-dependencies]
 proptest = "1"

@@ -3,6 +3,7 @@ mod import;
 mod layout;
 mod model;
 mod streaming;
+mod theme;
 mod ui;
 
 use std::path::PathBuf;
@@ -172,17 +173,24 @@ fn main() -> eframe::Result {
     let stream_manager_handle = StreamManagerHandle::new();
     let shutdown_handle = stream_manager_handle.clone();
 
-    let native_options = eframe::NativeOptions::default();
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Simple RTSP Viewer")
+            .with_inner_size([1280.0, 760.0])
+            .with_min_inner_size([560.0, 360.0])
+            // Transparent window so the Windows 11 Mica backdrop shows through.
+            .with_transparent(theme::mica_requested()),
+        ..Default::default()
+    };
 
     let run_result = eframe::run_native(
         "Simple RTSP Viewer",
         native_options,
-        Box::new(move |_cc| {
-            Ok(Box::new(SimpleRtspViewerApp::new(
-                cameras,
-                stream_manager_handle,
-                layout_path,
-            )) as Box<dyn eframe::App>)
+        Box::new(move |cc| {
+            Ok(Box::new(
+                SimpleRtspViewerApp::new(cameras, stream_manager_handle, layout_path)
+                    .with_windows_look(cc),
+            ) as Box<dyn eframe::App>)
         }),
     );
 

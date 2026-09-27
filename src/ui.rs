@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
 
@@ -21,6 +22,19 @@ use crate::grid;
 use crate::layout;
 use crate::model::{Camera, CameraFrame, ConnectionStatus, DisplaySize};
 use crate::streaming::{StreamChannels, StreamManagerHandle};
+use crate::theme;
+
+/// Space between the camera tiles and around the grid, as between Windows 11
+/// cards.
+const GAP: f32 = 8.0;
+
+/// Corner radius of the camera tiles (the same as Windows 11 cards).
+const TILE_ROUNDING: f32 = 8.0;
+
+/// How long the "double-click or Esc to go back" hint shows after enlarging a
+/// camera; it fades out during the last half second.
+const ENLARGED_HINT_DURATION: Duration = Duration::from_secs(3);
+const ENLARGED_HINT_FADE: Duration = Duration::from_millis(500);
 
 /// Capacity of each camera's frame channel (`CameraFrame`). A single frame:
 /// only the latest one matters to the UI, which drains the channel on every
@@ -111,6 +125,83 @@ fn fit_preserving_aspect(container: egui::Rect, content_size: egui::Vec2) -> egu
     egui::Rect::from_center_size(container.center(), content_size * scale)
 }
 
+/// Windows dark theme; without information from the system, assumes dark.
+fn is_dark(system_theme: Option<eframe::Theme>) -> bool {
+    system_theme.is_none_or(|theme| theme == eframe::Theme::Dark)
+}
+
+/// Pill-shaped status notice, centered in the tile: an indicator (spinner or
+/// colored dot) and the text.
+fn paint_status_pill(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    tile: egui::Rect,
+    label: &str,
+    color: Option<egui::Color32>,
+    spinner: bool,
+) {
+    const MARKER: f32 = 14.0;
+    let label = painter.layout_no_wrap(
+        label.to_owned(),
+        egui::FontId::proportional(13.0),
+        egui::Color32::WHITE,
+    );
+    let has_marker = spinner || color.is_some();
+    let marker_space = if has_marker { MARKER + 8.0 } else { 0.0 };
+    let pill = egui::Rect::from_center_size(
+        tile.center(),
+        egui::vec2(marker_space + label.size().x + 28.0, 30.0),
+    );
+    painter.rect_filled(pill, 15.0, theme::OVERLAY_CHIP);
+
+    let mut x = pill.left() + 14.0;
+    if has_marker {
+        let marker = egui::Rect::from_center_size(
+            egui::pos2(x + MARKER / 2.0, pill.center().y),
+            egui::vec2(MARKER, MARKER),
+        );
+        if spinner {
+            egui::Spinner::new()
+                .size(MARKER)
+                .color(color.unwrap_or(egui::Color32::WHITE))
+                .paint_at(ui, marker);
+        } else if let Some(color) = color {
+            painter.circle_filled(marker.center(), 4.0, color);
+        }
+        x += marker_space;
+    }
+    let y = pill.center().y - label.size().y / 2.0;
+    painter.galley(egui::pos2(x, y), label, egui::Color32::WHITE);
+}
+
+/// Label with the camera name in the bottom-left corner of the tile, with a
+/// green dot when the video is live. Omitted on tiles too narrow for it.
+fn paint_name_chip(painter: &egui::Painter, tile: egui::Rect, name: &str, live: bool) {
+    let label = painter.layout_no_wrap(
+        name.to_owned(),
+        egui::FontId::proportional(13.0),
+        egui::Color32::WHITE,
+    );
+    let dot_space = if live { 14.0 } else { 0.0 };
+    let size = egui::vec2(dot_space + label.size().x + 16.0, label.size().y + 8.0);
+    if size.x > tile.width() - 16.0 || size.y > tile.height() - 16.0 {
+        return;
+    }
+    let chip = egui::Rect::from_min_size(
+        egui::pos2(tile.left() + 8.0, tile.bottom() - 8.0 - size.y),
+        size,
+    );
+    painter.rect_filled(chip, 4.0, theme::OVERLAY_CHIP);
+
+    let mut x = chip.left() + 8.0;
+    if live {
+        painter.circle_filled(egui::pos2(x + 3.0, chip.center().y), 3.0, theme::SUCCESS);
+        x += dot_space;
+    }
+    let y = chip.center().y - label.size().y / 2.0;
+    painter.galley(egui::pos2(x, y), label, egui::Color32::WHITE);
+}
+
 /// `SimpleRtspViewerApp`: integration of the `Viewing_Grid` with
 /// `eframe`/`egui`.
 pub struct SimpleRtspViewerApp {
@@ -130,10 +221,44 @@ pub struct SimpleRtspViewerApp {
     /// Enlarged camera (filling the whole window), by its main `rtsp_url`;
     /// `None` shows the grid.
     enlarged: Option<String>,
+    /// When the current camera was enlarged, to show the hint on how to go back
+    /// for a few seconds.
+    enlarged_since: Option<Instant>,
     /// Handle to the `Stream_Manager`, used to open and close streams.
     stream_manager_handle: StreamManagerHandle,
     /// Path of the Layout_Config_File, used to persist the grid order.
     layout_path: PathBuf,
+    /// Windows 11 look in use.
+    look: Look,
+}
+
+/// Look state: palette of the current theme, Mica backdrop and Windows fonts.
+struct Look {
+    palette: theme::Palette,
+    /// Windows accent color, read at startup.
+    accent: egui::Color32,
+    /// Mica was requested (not turned off by the environment variable).
+    mica_requested: bool,
+    /// Mica is actually applied to the window (Windows 11).
+    mica: bool,
+    /// The Windows icon font was loaded.
+    icons: bool,
+    /// Theme (dark?) the style was last applied for.
+    applied_dark: Option<bool>,
+}
+
+impl Look {
+    fn new(dark: bool) -> Self {
+        let accent = theme::system_accent();
+        Self {
+            palette: theme::Palette::new(dark, accent),
+            accent,
+            mica_requested: false,
+            mica: false,
+            icons: false,
+            applied_dark: None,
+        }
+    }
 }
 
 impl SimpleRtspViewerApp {
@@ -166,11 +291,43 @@ impl SimpleRtspViewerApp {
             statuses,
             drag_state: None,
             enlarged: None,
+            enlarged_since: None,
             stream_manager_handle,
             layout_path,
+            look: Look::new(true),
         };
         app.sync_streams();
         app
+    }
+
+    /// Applies the Windows 11 look when the window is created: system fonts,
+    /// the current Windows light/dark theme, accent color and Mica backdrop.
+    pub fn with_windows_look(mut self, cc: &eframe::CreationContext<'_>) -> Self {
+        let dark = is_dark(cc.integration_info.system_theme);
+
+        self.look.icons = theme::install_fonts(&cc.egui_ctx);
+        self.look.mica_requested = theme::mica_requested();
+        self.look.mica = self.look.mica_requested && theme::apply_mica_on_start(cc, dark);
+        self.apply_theme(&cc.egui_ctx, dark);
+        self
+    }
+
+    /// Follows Windows light/dark theme changes while the app is open.
+    fn sync_theme(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let dark = is_dark(frame.info().system_theme);
+        if self.look.applied_dark == Some(dark) {
+            return;
+        }
+        if self.look.mica_requested {
+            self.look.mica = theme::apply_mica_on_frame(frame, dark);
+        }
+        self.apply_theme(ctx, dark);
+    }
+
+    fn apply_theme(&mut self, ctx: &egui::Context, dark: bool) {
+        self.look.palette = theme::Palette::new(dark, self.look.accent);
+        self.look.applied_dark = Some(dark);
+        theme::apply_style(ctx, &self.look.palette, self.look.mica);
     }
 
     /// Makes sure each camera has the right stream open for the current mode:
@@ -241,6 +398,7 @@ impl SimpleRtspViewerApp {
     /// switches the open streams accordingly.
     fn set_enlarged(&mut self, key: Option<String>) {
         if self.enlarged != key {
+            self.enlarged_since = key.as_ref().map(|_| Instant::now());
             self.enlarged = key;
             self.sync_streams();
         }
@@ -336,11 +494,20 @@ impl SimpleRtspViewerApp {
             self.drag_state = None;
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        // With Mica, the panel is transparent so the effect shows around and
+        // between the tiles.
+        let panel_fill = if self.look.mica {
+            egui::Color32::TRANSPARENT
+        } else {
+            self.look.palette.window_background
+        };
+        let panel = egui::Frame::none()
+            .fill(panel_fill)
+            .inner_margin(egui::Margin::same(GAP));
+
+        egui::CentralPanel::default().frame(panel).show(ctx, |ui| {
             if self.cameras.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.label("No cameras loaded.");
-                });
+                self.paint_empty_state(ui);
                 return;
             }
 
@@ -351,9 +518,11 @@ impl SimpleRtspViewerApp {
 
             let (columns, rows) = grid::grid_dimensions(self.cameras.len());
             let available = ui.available_size();
+            // The gaps between the tiles come out of the available size, so the
+            // grid fits the panel exactly.
             let cell_size = egui::vec2(
-                (available.x / columns as f32).max(1.0),
-                (available.y / rows as f32).max(1.0),
+                ((available.x - GAP * (columns - 1) as f32) / columns as f32).max(1.0),
+                ((available.y - GAP * (rows - 1) as f32) / rows as f32).max(1.0),
             );
 
             let mut reorder: Option<(usize, usize)> = None;
@@ -362,7 +531,7 @@ impl SimpleRtspViewerApp {
             egui::Grid::new("camera_grid")
                 .min_col_width(cell_size.x)
                 .min_row_height(cell_size.y)
-                .spacing(egui::vec2(2.0, 2.0))
+                .spacing(egui::vec2(GAP, GAP))
                 .show(ui, |ui| {
                     for row in 0..rows {
                         for col in 0..columns {
@@ -395,10 +564,103 @@ impl SimpleRtspViewerApp {
     fn enlarged_block(&mut self, ui: &mut egui::Ui, index: usize) {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
         self.paint_camera(ui, index, rect);
+        self.paint_enlarged_hint(ui, rect);
 
         if response.double_clicked() || ui.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.set_enlarged(None);
         }
+    }
+
+    /// Hint on how to go back to the grid, in the top-right corner of the
+    /// enlarged camera, during the first seconds after enlarging.
+    fn paint_enlarged_hint(&self, ui: &egui::Ui, rect: egui::Rect) {
+        let Some(since) = self.enlarged_since else {
+            return;
+        };
+        let elapsed = since.elapsed();
+        if elapsed >= ENLARGED_HINT_DURATION {
+            return;
+        }
+        let remaining = ENLARGED_HINT_DURATION - elapsed;
+        let opacity = (remaining.as_secs_f32() / ENLARGED_HINT_FADE.as_secs_f32()).min(1.0);
+        let text_color = egui::Color32::WHITE.gamma_multiply(opacity);
+
+        let painter = ui.painter().with_clip_rect(rect);
+        let label = painter.layout_no_wrap(
+            "Double-click or Esc to go back to the grid".to_owned(),
+            egui::FontId::proportional(13.0),
+            text_color,
+        );
+        let icon = self.look.icons.then(|| {
+            painter.layout_no_wrap(
+                theme::ICON_BACK_TO_WINDOW.to_owned(),
+                theme::icon_font(14.0),
+                text_color,
+            )
+        });
+        let icon_space = icon.as_ref().map_or(0.0, |icon| icon.size().x + 8.0);
+
+        let size = egui::vec2(icon_space + label.size().x + 24.0, 32.0);
+        let chip = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - 12.0 - size.x, rect.top() + 12.0),
+            size,
+        );
+        painter.rect_filled(chip, 6.0, theme::OVERLAY_CHIP.gamma_multiply(opacity));
+
+        let mut x = chip.left() + 12.0;
+        if let Some(icon) = icon {
+            let y = chip.center().y - icon.size().y / 2.0;
+            painter.galley(egui::pos2(x, y), icon, text_color);
+            x += icon_space;
+        }
+        let y = chip.center().y - label.size().y / 2.0;
+        painter.galley(egui::pos2(x, y), label, text_color);
+
+        // Keeps the fade-out animation running even without new frames.
+        ui.ctx().request_repaint_after(Duration::from_millis(50));
+    }
+
+    /// Screen without cameras: icon, title and how to open a camera file.
+    fn paint_empty_state(&self, ui: &egui::Ui) {
+        let palette = &self.look.palette;
+        let rect = ui.available_rect_before_wrap();
+        let painter = ui.painter();
+        let center_x = rect.center().x;
+        let mut y = rect.center().y - 48.0;
+
+        if self.look.icons {
+            painter.text(
+                egui::pos2(center_x, y),
+                egui::Align2::CENTER_CENTER,
+                theme::ICON_VIDEO,
+                theme::icon_font(40.0),
+                palette.text_secondary,
+            );
+            y += 48.0;
+        }
+        painter.text(
+            egui::pos2(center_x, y),
+            egui::Align2::CENTER_CENTER,
+            "No cameras loaded",
+            theme::semibold(20.0),
+            palette.text,
+        );
+        y += 32.0;
+        painter.text(
+            egui::pos2(center_x, y),
+            egui::Align2::CENTER_CENTER,
+            "Open the app passing a camera file:",
+            egui::FontId::proportional(14.0),
+            palette.text_secondary,
+        );
+        y += 24.0;
+        painter.text(
+            egui::pos2(center_x, y),
+            egui::Align2::CENTER_CENTER,
+            "simple-rtsp-viewer.exe cameras.json",
+            egui::FontId::monospace(13.0),
+            palette.text_secondary,
+        );
     }
 
     /// Draws camera `index` in `rect` and tells its `StreamTask` the size at
@@ -412,11 +674,11 @@ impl SimpleRtspViewerApp {
             .copied()
             .unwrap_or(ConnectionStatus::Disconnected);
 
-        Self::paint_block_contents(
+        self.paint_tile(
             ui,
             rect,
             self.textures.get(key),
-            grid::status_indicator(status),
+            status,
             camera.name.as_deref(),
         );
         self.report_display_size(key, rect.size(), ui.ctx().pixels_per_point());
@@ -439,8 +701,18 @@ impl SimpleRtspViewerApp {
         // `dnd_drag_source` only detects dragging; adding click sensing to the
         // same widget allows double-clicking to enlarge. With both, egui tells
         // a click from a drag by the pointer movement.
-        if response.interact(egui::Sense::click()).double_clicked() {
+        let response = response.interact(egui::Sense::click());
+        if response.double_clicked() {
             return BlockAction::Enlarge;
+        }
+
+        // Border a little more visible when hovered, as on Windows 11 cards.
+        if response.hovered() && !response.dragged() {
+            ui.painter().rect_stroke(
+                response.rect,
+                TILE_ROUNDING,
+                egui::Stroke::new(1.0_f32, self.look.palette.tile_border_hover),
+            );
         }
 
         // While this tile is being dragged, keeps `drag_state.from` pointing to
@@ -467,12 +739,12 @@ impl SimpleRtspViewerApp {
                         state.hover_to = Some(index);
                     }
                 }
-                // Visual indication of the target position during the drag (Requirement
-                // 4.3).
+                // Visual indication of the target position during the drag
+                // (Requirement 4.3), in the Windows accent color.
                 ui.painter().rect_stroke(
                     response.rect,
-                    4.0,
-                    egui::Stroke::new(3.0, egui::Color32::YELLOW),
+                    TILE_ROUNDING,
+                    egui::Stroke::new(2.0_f32, self.look.palette.accent),
                 );
             }
         }
@@ -488,74 +760,87 @@ impl SimpleRtspViewerApp {
         action
     }
 
-    /// Paints the visual content of a `Camera_Tile`: the latest video texture
-    /// (or a placeholder, if no frame has been decoded yet), the camera name
-    /// (if any) and the connection status overlay matching `indicator`
-    /// (Requirements 2.4, 2.5, 2.6).
-    fn paint_block_contents(
+    /// Paints a `Camera_Tile` as a Windows 11 card: dark background with
+    /// rounded corners, the latest video fitted keeping its aspect ratio, the
+    /// camera name in a label in the bottom-left corner and the connection
+    /// status notice (Requirements 2.4, 2.5, 2.6).
+    fn paint_tile(
+        &self,
         ui: &egui::Ui,
         rect: egui::Rect,
         texture: Option<&egui::TextureHandle>,
-        indicator: grid::IndicatorKind,
+        status: ConnectionStatus,
         name: Option<&str>,
     ) {
-        let painter = ui.painter();
+        let palette = &self.look.palette;
+        let painter = ui.painter().with_clip_rect(rect.expand(1.0));
+        painter.rect_filled(rect, TILE_ROUNDING, palette.tile_background);
 
-        match texture {
-            Some(tex) => {
-                // The video is fitted keeping its original aspect ratio; the
-                // rest of the tile gets black bars (on the sides or
-                // above/below).
-                painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
-                painter.image(
-                    tex.id(),
-                    fit_preserving_aspect(rect, tex.size_vec2()),
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
+        if let Some(texture) = texture {
+            let mut video = egui::epaint::RectShape::filled(
+                fit_preserving_aspect(rect, texture.size_vec2()),
+                TILE_ROUNDING,
+                egui::Color32::WHITE,
+            );
+            video.fill_texture_id = texture.id();
+            video.uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            painter.add(video);
+        }
+
+        // Status notices: distinct from each other and from normal video, which
+        // gets no notice (Requirements 2.5, 2.6). Over a frozen video, the
+        // video is darkened so the notice stands out.
+        let has_video = texture.is_some();
+        let dim = |painter: &egui::Painter| {
+            painter.rect_filled(rect, TILE_ROUNDING, egui::Color32::from_black_alpha(140));
+        };
+        match grid::status_indicator(status) {
+            grid::IndicatorKind::None => {
+                if !has_video {
+                    // Connected, but the first frame has not arrived yet.
+                    paint_status_pill(ui, &painter, rect, "Connecting…", None, true);
+                }
+            }
+            grid::IndicatorKind::Reconnecting => {
+                if has_video {
+                    dim(&painter);
+                }
+                paint_status_pill(
+                    ui,
+                    &painter,
+                    rect,
+                    "Reconnecting…",
+                    Some(theme::CAUTION),
+                    true,
                 );
             }
-            None => {
-                // No frame decoded yet: neutral placeholder instead of video.
-                painter.rect_filled(rect, 0.0, egui::Color32::from_gray(40));
+            grid::IndicatorKind::Disconnected if has_video => {
+                dim(&painter);
+                paint_status_pill(
+                    ui,
+                    &painter,
+                    rect,
+                    "Disconnected",
+                    Some(theme::CRITICAL),
+                    false,
+                );
+            }
+            grid::IndicatorKind::Disconnected => {
+                // Initial state: the first connection is still in progress.
+                paint_status_pill(ui, &painter, rect, "Connecting…", None, true);
             }
         }
 
         if let Some(name) = name {
-            painter.text(
-                rect.left_top() + egui::vec2(4.0, 4.0),
-                egui::Align2::LEFT_TOP,
-                name,
-                egui::FontId::default(),
-                egui::Color32::WHITE,
-            );
+            let live = has_video && status == ConnectionStatus::Connected;
+            paint_name_chip(&painter, rect, name, live);
         }
 
-        // "disconnected"/"reconnecting" overlays: visually distinct from each
-        // other (different color and text) and from normal video rendering,
-        // which gets no overlay when `indicator` is `IndicatorKind::None`
-        // (Requirements 2.5, 2.6).
-        let overlay = match indicator {
-            grid::IndicatorKind::None => None,
-            grid::IndicatorKind::Disconnected => Some((
-                "Disconnected",
-                egui::Color32::from_rgba_unmultiplied(120, 20, 20, 200),
-            )),
-            grid::IndicatorKind::Reconnecting => Some((
-                "Reconnecting",
-                egui::Color32::from_rgba_unmultiplied(130, 95, 0, 200),
-            )),
-        };
-
-        if let Some((label, color)) = overlay {
-            painter.rect_filled(rect, 0.0, color);
-            painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                label,
-                egui::FontId::proportional(16.0),
-                egui::Color32::WHITE,
-            );
-        }
+        painter.rect_stroke(
+            rect,
+            TILE_ROUNDING,
+            egui::Stroke::new(1.0_f32, palette.tile_border),
+        );
     }
 
     /// Applies the `from`/`to` position swap to `self.cameras` and, if the
@@ -601,11 +886,25 @@ impl SimpleRtspViewerApp {
 }
 
 impl eframe::App for SimpleRtspViewerApp {
+    /// Color the window is cleared with before each frame: transparent with
+    /// Mica (so the effect shows), the theme background color without it.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if self.look.mica {
+            [0.0; 4]
+        } else {
+            self.look
+                .palette
+                .window_background
+                .to_normalized_gamma_f32()
+        }
+    }
+
     /// Main UI loop, called on every `eframe` frame. Drains the pending events
     /// of each camera, redraws the grid (handling drag-and-drop) and requests
     /// an immediate repaint, to keep the video display responsive even without
     /// user interaction (Requirements 2.4, 2.7, 3.5).
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.sync_theme(ctx, frame);
         let received_update = self.drain_camera_events(ctx);
         self.draw_grid(ctx);
 
