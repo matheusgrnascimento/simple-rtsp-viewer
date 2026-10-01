@@ -12,6 +12,8 @@ Simple desktop viewer for watching multiple RTSP cameras in a grid. The project 
 - double-click to enlarge a camera (double-click or `Esc` returns to the grid);
 - substream (lower resolution) in the grid, main stream only for the enlarged camera;
 - frames scaled down to their on-screen size during decoding, keeping the aspect ratio;
+- GPU video decoding (D3D11VA), falling back to the CPU automatically when the GPU does not support the video;
+- Windows 11 look: light/dark theme following the system, Windows accent color, Segoe fonts and Mica backdrop;
 - automatic persistence of the grid order in `layout.json`;
 - support for RTSP URLs with authentication, without exposing credentials in the logs.
 
@@ -77,6 +79,17 @@ On Windows, after running the setup:
 
 ```powershell
 .\target\release\simple-rtsp-viewer.exe cameras.json
+```
+
+Two environment variables turn off features that depend on the video driver, useful to compare performance or to work around problems:
+
+| Variable | Effect when `0` |
+|---|---|
+| `RTSP_VIEWER_GPU_DECODE` | decodes on the CPU instead of the GPU |
+| `RTSP_VIEWER_MICA` | uses a solid background instead of Mica |
+
+```powershell
+$env:RTSP_VIEWER_GPU_DECODE = "0"; .\target\release\simple-rtsp-viewer.exe cameras.json
 ```
 
 If no path is given, the app opens the system file picker. The order set by drag and drop is saved to `layout.json` in the working directory and applied again on the next start.
