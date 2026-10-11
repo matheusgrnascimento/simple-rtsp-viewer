@@ -17,6 +17,9 @@ rfd = "0.17.2"
 # Windows 11 Mica backdrop (on Windows 10 and other systems the call simply
 # fails and the window uses a solid background).
 window-vibrancy = "0.8"
+# System credential vault: only the Windows Credential Manager, without the
+# Linux/macOS backends and their dependencies.
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
 
 [target.'cfg(windows)'.dependencies]
 # Reads the Windows accent color from the registry.
