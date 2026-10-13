@@ -3,6 +3,7 @@ mod grid;
 mod import;
 mod layout;
 mod model;
+mod rtsp_url;
 mod streaming;
 mod theme;
 mod ui;
