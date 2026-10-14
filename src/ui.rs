@@ -939,6 +939,7 @@ mod tests {
 
     fn camera(url: &str) -> Camera {
         Camera {
+            id: url.to_string(),
             rtsp_url: url.to_string(),
             name: None,
             substream_url: None,
@@ -979,6 +980,7 @@ mod tests {
         // Addresses without a server: the StreamTasks just keep trying to
         // connect.
         let with_substream = Camera {
+            id: "a".to_string(),
             rtsp_url: "rtsp://127.0.0.1:1/main-a".to_string(),
             name: None,
             substream_url: Some("rtsp://127.0.0.1:1/sub-a".to_string()),

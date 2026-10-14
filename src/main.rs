@@ -5,6 +5,7 @@ mod import;
 mod layout;
 mod model;
 mod rtsp_url;
+mod store;
 mod streaming;
 mod theme;
 mod ui;

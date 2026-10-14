@@ -36,7 +36,7 @@ pub struct ImportOutcome {
 /// Checks whether `url` matches the pattern
 /// `rtsp://[user:password@]host[:port]/path` and respects the `MAX_URL_LEN`
 /// character limit.
-fn is_valid_rtsp_url(url: &str) -> bool {
+pub fn is_valid_rtsp_url(url: &str) -> bool {
     if url.chars().count() > MAX_URL_LEN {
         return false;
     }
@@ -162,6 +162,9 @@ pub fn validate_and_import(entries: &[ImportedEntry]) -> ImportOutcome {
 
         if cameras.len() < MAX_CAMERAS {
             cameras.push(Camera {
+                // The URL is unique within the import; the app's store
+                // generates the final id when it saves the camera.
+                id: entry.raw_url.clone(),
                 rtsp_url: entry.raw_url.clone(),
                 name,
                 substream_url,

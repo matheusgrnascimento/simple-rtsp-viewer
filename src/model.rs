@@ -3,6 +3,10 @@
 /// A camera loaded from the Import_File.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Camera {
+    /// Stable camera id, which does not change when the address or the login
+    /// change. The UI keeps each camera's state by it.
+    #[serde(default)]
+    pub id: String,
     pub rtsp_url: String,     // up to 2048 characters, validated on import
     pub name: Option<String>, // up to 100 characters, validated on import
     /// The camera's secondary stream (lower resolution), shown in the grid. The
@@ -127,6 +131,7 @@ mod tests {
     #[test]
     fn stream_url_uses_substream_in_grid_and_main_when_enlarged() {
         let camera = Camera {
+            id: "a".to_string(),
             rtsp_url: "rtsp://host/main".to_string(),
             name: None,
             substream_url: Some("rtsp://host/sub".to_string()),
@@ -138,6 +143,7 @@ mod tests {
     #[test]
     fn stream_url_without_substream_is_always_main() {
         let camera = Camera {
+            id: "b".to_string(),
             rtsp_url: "rtsp://host/main".to_string(),
             name: None,
             substream_url: None,
