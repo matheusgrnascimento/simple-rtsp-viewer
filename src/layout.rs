@@ -112,7 +112,7 @@ pub fn load_layout_file(path: &Path) -> Result<LayoutFile, LayoutLoadError> {
     Ok(layout)
 }
 
-/// Writes `layout` to `path` atomically (Requirements 5.7, 8.1, 8.3).
+/// Writes `value` to `path` as JSON, atomically (Requirements 5.7, 8.1, 8.3).
 ///
 /// The write goes to a temporary file in the same directory as `path` (so the
 /// final `rename` is atomic on the same file system), with the JSON content
@@ -121,7 +121,10 @@ pub fn load_layout_file(path: &Path) -> Result<LayoutFile, LayoutLoadError> {
 /// rename never leaves `path` truncated or corrupted: if any step before the
 /// rename fails, the temporary file is removed and the content previously saved
 /// in `path` stays intact.
-pub fn save_layout_file(path: &Path, layout: &LayoutFile) -> Result<(), std::io::Error> {
+pub fn save_json_atomically<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+) -> Result<(), std::io::Error> {
     // Global counter that makes the temporary file name unique across
     // concurrent writes from the same process. Without it, two writes fired in
     // quick succession (e.g. two reorders in a row, each on its own
@@ -145,7 +148,7 @@ pub fn save_layout_file(path: &Path, layout: &LayoutFile) -> Result<(), std::io:
     let write_result = (|| -> Result<(), std::io::Error> {
         let file = fs::File::create(&temp_path)?;
         let mut writer = std::io::BufWriter::new(file);
-        serde_json::to_writer_pretty(&mut writer, layout).map_err(std::io::Error::from)?;
+        serde_json::to_writer_pretty(&mut writer, value).map_err(std::io::Error::from)?;
         let file = writer.into_inner().map_err(|err| err.into_error())?;
         file.sync_all()?;
         Ok(())
@@ -321,7 +324,7 @@ mod tests {
         let layout = LayoutFile {
             camera_order: vec!["rtsp://a".to_string(), "rtsp://b".to_string()],
         };
-        save_layout_file(&path, &layout).unwrap();
+        save_json_atomically(&path, &layout).unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
         // JSON indented over multiple lines (Requirement 8.1).
@@ -359,11 +362,11 @@ mod tests {
         let first = LayoutFile {
             camera_order: vec!["rtsp://first".to_string()],
         };
-        save_layout_file(&path, &first).unwrap();
+        save_json_atomically(&path, &first).unwrap();
         let second = LayoutFile {
             camera_order: vec!["rtsp://second".to_string()],
         };
-        save_layout_file(&path, &second).unwrap();
+        save_json_atomically(&path, &second).unwrap();
         assert_eq!(
             load_layout_file(&path).unwrap().camera_order,
             second.camera_order

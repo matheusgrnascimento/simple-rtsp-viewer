@@ -859,16 +859,16 @@ impl SimpleRtspViewerApp {
 
     /// Triggers the async (fire-and-forget) write of the `Layout_Config_File`
     /// reflecting the current order of `self.cameras`, without blocking the UI thread
-    /// (Requirement 5.1). The disk write (`layout::save_layout_file`, synchronous) runs
-    /// on a thread of tokio's blocking pool via `spawn_blocking`; failures are only
-    /// logged, without interrupting the app (Requirement 5.7).
+    /// (Requirement 5.1). The disk write (`layout::save_json_atomically`, synchronous)
+    /// runs on a thread of tokio's blocking pool via `spawn_blocking`; failures are
+    /// only logged, without interrupting the app (Requirement 5.7).
     fn persist_layout(&self) {
         let layout_path = self.layout_path.clone();
         let layout_file = layout::build_layout_file(&self.cameras);
 
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                layout::save_layout_file(&layout_path, &layout_file)
+                layout::save_json_atomically(&layout_path, &layout_file)
             })
             .await;
 
