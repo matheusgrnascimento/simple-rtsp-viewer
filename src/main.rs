@@ -1,4 +1,5 @@
 mod credentials;
+mod discovery;
 mod grid;
 mod import;
 mod layout;

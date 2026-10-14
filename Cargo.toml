@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 egui = "0.28"
 eframe = "0.28"
-tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "net"] }
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 ffmpeg-next = "7"
 serde = { version = "1", features = ["derive"] }
@@ -17,6 +17,8 @@ rfd = "0.17.2"
 # Windows 11 Mica backdrop (on Windows 10 and other systems the call simply
 # fails and the window uses a solid background).
 window-vibrancy = "0.8"
+# IPv4 addresses of the network interfaces, to know which subnets to scan.
+if-addrs = "0.15"
 # System credential vault: only the Windows Credential Manager, without the
 # Linux/macOS backends and their dependencies.
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
