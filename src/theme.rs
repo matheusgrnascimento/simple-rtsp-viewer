@@ -23,6 +23,13 @@ pub const OVERLAY_CHIP: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 170)
 /// Glyphs of the Windows icon font (Segoe Fluent Icons / MDL2 Assets).
 pub const ICON_VIDEO: &str = "\u{E714}";
 pub const ICON_BACK_TO_WINDOW: &str = "\u{E73F}";
+pub const ICON_SEARCH: &str = "\u{E721}";
+pub const ICON_IMPORT: &str = "\u{E8B5}";
+pub const ICON_KEY: &str = "\u{E8D7}";
+pub const ICON_INFO: &str = "\u{E946}";
+pub const ICON_WARNING: &str = "\u{E7BA}";
+pub const ICON_SUCCESS: &str = "\u{E73E}";
+pub const ICON_CLOSE: &str = "\u{E711}";
 
 /// Semibold font family, used in titles.
 const SEMIBOLD: &str = "semibold";
@@ -45,6 +52,25 @@ pub struct Palette {
     /// Windows accent color, adjusted to the theme as the system does (lighter
     /// in dark mode, darker in light mode).
     pub accent: Color32,
+    /// Text on the accent color (primary button).
+    pub on_accent: Color32,
+    /// Dialog background.
+    pub dialog_background: Color32,
+    /// Buttons and controls: normal, hovered and pressed background, and
+    /// border.
+    pub control_fill: Color32,
+    pub control_fill_hover: Color32,
+    pub control_fill_pressed: Color32,
+    pub control_stroke: Color32,
+    /// Text field background.
+    pub input_background: Color32,
+    /// Success and error text on the theme background.
+    pub success_text: Color32,
+    pub critical_text: Color32,
+    /// Backgrounds of the notice bars (InfoBar): info, success and error.
+    pub notice_info: Color32,
+    pub notice_success: Color32,
+    pub notice_error: Color32,
 }
 
 impl Palette {
@@ -59,6 +85,18 @@ impl Palette {
                 text: Color32::WHITE,
                 text_secondary: Color32::from_rgb(0xC5, 0xC5, 0xC5),
                 accent: mix(system_accent, Color32::WHITE, 0.4),
+                on_accent: Color32::BLACK,
+                dialog_background: Color32::from_rgb(0x2B, 0x2B, 0x2B),
+                control_fill: Color32::from_rgb(0x37, 0x37, 0x37),
+                control_fill_hover: Color32::from_rgb(0x3C, 0x3C, 0x3C),
+                control_fill_pressed: Color32::from_rgb(0x31, 0x31, 0x31),
+                control_stroke: Color32::from_white_alpha(20),
+                input_background: Color32::from_rgb(0x1F, 0x1F, 0x1F),
+                success_text: SUCCESS,
+                critical_text: CRITICAL,
+                notice_info: Color32::from_rgb(0x2B, 0x2B, 0x2B),
+                notice_success: Color32::from_rgb(0x39, 0x3D, 0x1B),
+                notice_error: Color32::from_rgb(0x44, 0x27, 0x26),
             }
         } else {
             Self {
@@ -70,6 +108,18 @@ impl Palette {
                 text: Color32::from_rgb(0x1A, 0x1A, 0x1A),
                 text_secondary: Color32::from_rgb(0x5D, 0x5D, 0x5D),
                 accent: mix(system_accent, Color32::BLACK, 0.15),
+                on_accent: Color32::WHITE,
+                dialog_background: Color32::from_rgb(0xF9, 0xF9, 0xF9),
+                control_fill: Color32::from_rgb(0xFB, 0xFB, 0xFB),
+                control_fill_hover: Color32::from_rgb(0xF5, 0xF5, 0xF5),
+                control_fill_pressed: Color32::from_rgb(0xEE, 0xEE, 0xEE),
+                control_stroke: Color32::from_black_alpha(28),
+                input_background: Color32::WHITE,
+                success_text: Color32::from_rgb(0x0F, 0x7B, 0x0F),
+                critical_text: Color32::from_rgb(0xC4, 0x2B, 0x1C),
+                notice_info: Color32::from_rgb(0xF6, 0xF6, 0xF6),
+                notice_success: Color32::from_rgb(0xDF, 0xF6, 0xDD),
+                notice_error: Color32::from_rgb(0xFD, 0xE7, 0xE9),
             }
         }
     }
@@ -138,6 +188,14 @@ pub fn apply_mica_on_frame(frame: &eframe::Frame, dark: bool) -> bool {
 /// without embedding them in the executable; missing ones fall back to egui's
 /// default fonts. Returns `true` if the icon font was loaded.
 pub fn install_fonts(ctx: &egui::Context) -> bool {
+    let (fonts, icons) = windows_font_definitions();
+    ctx.set_fonts(fonts);
+    icons
+}
+
+/// egui font definitions with the Windows fonts found, and whether the icon
+/// font is among them.
+fn windows_font_definitions() -> (egui::FontDefinitions, bool) {
     let mut fonts = egui::FontDefinitions::default();
     let defaults = fonts
         .families
@@ -171,6 +229,17 @@ pub fn install_fonts(ctx: &egui::Context) -> bool {
         semibold_family.insert(0, "Segoe UI Semibold".to_owned());
     }
 
+    if icons {
+        // The regular fonts are added as fallback: egui requires every family
+        // to have the replacement character ('◻' or '?'), which the icon font
+        // lacks. Without it, egui prints a warning to the console when the
+        // family is used.
+        let mut icon_family = vec!["Segoe Icons".to_owned()];
+        icon_family.extend(proportional.iter().cloned());
+        fonts
+            .families
+            .insert(FontFamily::Name(ICONS.into()), icon_family);
+    }
     fonts
         .families
         .insert(FontFamily::Proportional, proportional);
@@ -179,15 +248,8 @@ pub fn install_fonts(ctx: &egui::Context) -> bool {
     fonts
         .families
         .insert(FontFamily::Name(SEMIBOLD.into()), semibold_family);
-    if icons {
-        fonts.families.insert(
-            FontFamily::Name(ICONS.into()),
-            vec!["Segoe Icons".to_owned()],
-        );
-    }
 
-    ctx.set_fonts(fonts);
-    icons
+    (fonts, icons)
 }
 
 fn read_windows_font(file: &str) -> Option<Vec<u8>> {
@@ -219,9 +281,12 @@ pub fn apply_style(ctx: &egui::Context, palette: &Palette, mica: bool) {
     } else {
         palette.window_background
     };
-    visuals.window_fill = palette.window_background;
+    // Dialogs and menus.
+    visuals.window_fill = palette.dialog_background;
+    visuals.window_stroke = egui::Stroke::new(1.0_f32, palette.control_stroke);
     visuals.window_rounding = egui::Rounding::same(8.0);
     visuals.menu_rounding = egui::Rounding::same(8.0);
+    visuals.extreme_bg_color = palette.input_background;
     visuals.selection.bg_fill = palette.accent;
     visuals.selection.stroke = egui::Stroke::new(1.0_f32, palette.accent);
     visuals.hyperlink_color = palette.accent;
@@ -234,9 +299,25 @@ pub fn apply_style(ctx: &egui::Context, palette: &Palette, mica: bool) {
     ] {
         widget.rounding = egui::Rounding::same(4.0);
     }
+    // Buttons and controls: subtle background with a thin border, a little
+    // lighter when hovered and darker when pressed, as in Windows 11.
+    let control_stroke = egui::Stroke::new(1.0_f32, palette.control_stroke);
+    visuals.widgets.inactive.weak_bg_fill = palette.control_fill;
+    visuals.widgets.inactive.bg_fill = palette.control_fill;
+    visuals.widgets.inactive.bg_stroke = control_stroke;
+    visuals.widgets.hovered.weak_bg_fill = palette.control_fill_hover;
+    visuals.widgets.hovered.bg_fill = palette.control_fill_hover;
+    visuals.widgets.hovered.bg_stroke = control_stroke;
+    visuals.widgets.active.weak_bg_fill = palette.control_fill_pressed;
+    visuals.widgets.active.bg_fill = palette.control_fill_pressed;
+    visuals.widgets.active.bg_stroke = control_stroke;
+    visuals.widgets.open.weak_bg_fill = palette.control_fill_hover;
     ctx.set_visuals(visuals);
 
     ctx.style_mut(|style| {
+        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        style.spacing.button_padding = egui::vec2(12.0, 5.0);
+        style.spacing.window_margin = egui::Margin::same(20.0);
         use egui::TextStyle;
         style
             .text_styles
@@ -264,6 +345,25 @@ mod tests {
             mix(from, Color32::WHITE, 0.5),
             Color32::from_rgb(128, 178, 228)
         );
+    }
+
+    #[test]
+    fn every_font_family_keeps_the_default_fonts_as_fallback() {
+        // egui's default fonts have the replacement character; without them in
+        // a family, egui warns "Failed to find replacement characters".
+        let defaults = egui::FontDefinitions::default().families[&FontFamily::Proportional].clone();
+        let (fonts, _icons) = windows_font_definitions();
+        for (family, names) in &fonts.families {
+            if *family == FontFamily::Monospace {
+                continue;
+            }
+            for default in &defaults {
+                assert!(
+                    names.contains(default),
+                    "family {family:?} does not have the default font {default}"
+                );
+            }
+        }
     }
 
     #[test]
