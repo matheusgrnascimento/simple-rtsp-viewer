@@ -1,28 +1,35 @@
 //! SimpleRtspViewerApp: eframe/egui integration.
 //!
-//! This module implements the `Viewing_Grid`: it builds the initial app state
-//! from the already reconciled camera list (`import` +
-//! `layout::restore_order`), drains without blocking the events produced by the
-//! `StreamTask`s of the `Stream_Manager`, draws the grid of `Camera_Tile`s and
-//! handles drag-and-drop reordering, triggering the async layout persistence
-//! when the in-memory order changes.
+//! This module implements the `Viewing_Grid`: it builds the cameras from the
+//! app's library (`store`), drains without blocking the events produced by the
+//! `StreamTask`s of the `Stream_Manager`, draws the command bar and the grid of
+//! `Camera_Tile`s, and handles drag-and-drop reordering and the camera
+//! management dialogs, saving the library when it changes.
 //!
 //! No network I/O, decoding or file write happens directly on the UI thread:
 //! communication with the `Stream_Manager` goes through channels
-//! (`tokio::sync::mpsc`) and the layout persistence is triggered with
-//! `tokio::spawn` (fire-and-forget), as in design.md.
+//! (`tokio::sync::mpsc`) and the library write is triggered with `tokio::spawn`
+//! (fire-and-forget), as in design.md. The exceptions are the Windows
+//! credential vault, written right when the user saves a login, and the
+//! "Import" file picker.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
 
+use crate::credentials;
+use crate::dialogs::{self, CameraForm, Dialog, DialogAction, DialogEnv, LoginForm, ScanDialog};
 use crate::grid;
-use crate::layout;
+use crate::import;
 use crate::model::{Camera, CameraFrame, ConnectionStatus, DisplaySize};
+use crate::store::{self, CameraLibrary};
 use crate::streaming::{StreamChannels, StreamManagerHandle};
 use crate::theme;
+
+/// How long a confirmation (success) message stays in the notice bar; error
+/// messages stay until they are closed.
+const NOTICE_DURATION: Duration = Duration::from_secs(6);
 
 /// Space between the camera tiles and around the grid, as between Windows 11
 /// cards.
@@ -82,8 +89,34 @@ enum BlockAction {
         from: usize,
         to: usize,
     },
-    /// Double-clicked the tile to enlarge it.
+    /// Double-clicked the tile (or used the menu) to enlarge it.
     Enlarge,
+    /// Asked to edit the camera from the context menu.
+    Edit,
+    /// Asked to remove the camera from the context menu.
+    Remove,
+}
+
+/// Action requested from the command bar.
+enum Command {
+    AddCamera,
+    Scan,
+    Import,
+    SharedLogin,
+}
+
+/// Message in the notice bar, below the command bar.
+struct Notice {
+    kind: NoticeKind,
+    text: String,
+    /// When the message appeared (success messages go away on their own).
+    since: Instant,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NoticeKind {
+    Success,
+    Error,
 }
 
 /// State of a drag-and-drop operation in progress on the `Viewing_Grid`
@@ -207,27 +240,31 @@ fn paint_name_chip(painter: &egui::Painter, tile: egui::Rect, name: &str, live: 
 pub struct SimpleRtspViewerApp {
     /// Current in-memory camera order (reflected in the grid).
     cameras: Vec<Camera>,
-    /// Stream open for each camera, keyed by the camera's main `rtsp_url`
-    /// (which identifies it even when the open one is the substream). The
+    /// Stream open for each camera, keyed by the camera `id` (which identifies
+    /// it even when the open one is the substream or the login changed). The
     /// status comes in a `watch`, which always holds the latest value, so no
     /// status change is lost even with the frame channel full.
     streams: HashMap<String, ActiveStream>,
-    /// Last GPU texture loaded for each camera, keyed by `rtsp_url`.
+    /// Last GPU texture loaded for each camera, keyed by `id`.
     textures: HashMap<String, egui::TextureHandle>,
-    /// Last `ConnectionStatus` read for each camera, keyed by `rtsp_url`.
+    /// Last `ConnectionStatus` read for each camera, keyed by `id`.
     statuses: HashMap<String, ConnectionStatus>,
     /// State of the drag-and-drop operation in progress, if any.
     drag_state: Option<DragState>,
-    /// Enlarged camera (filling the whole window), by its main `rtsp_url`;
-    /// `None` shows the grid.
+    /// Enlarged camera (filling the whole window), by `id`; `None` shows the
+    /// grid.
     enlarged: Option<String>,
     /// When the current camera was enlarged, to show the hint on how to go back
     /// for a few seconds.
     enlarged_since: Option<Instant>,
     /// Handle to the `Stream_Manager`, used to open and close streams.
     stream_manager_handle: StreamManagerHandle,
-    /// Path of the Layout_Config_File, used to persist the grid order.
-    layout_path: PathBuf,
+    /// Camera library (stored list and logins), source of `cameras`.
+    library: CameraLibrary,
+    /// Open dialog, if any.
+    dialog: Option<Dialog>,
+    /// Message in the notice bar, if any.
+    notice: Option<Notice>,
     /// Windows 11 look in use.
     look: Look,
 }
@@ -262,8 +299,7 @@ impl Look {
 }
 
 impl SimpleRtspViewerApp {
-    /// Builds the initial app state from `cameras` (already reconciled by
-    /// `layout::restore_order` from the `Config_Importer` result), starting the
+    /// Builds the initial app state from the camera library, starting the
     /// decoding of each camera through `stream_manager_handle` (Requirements
     /// 2.1, 2.3, 3.1).
     ///
@@ -274,30 +310,58 @@ impl SimpleRtspViewerApp {
     ///
     /// `StreamManagerHandle::new` needs an active tokio runtime on the current
     /// thread; the commands sent here are synchronous.
-    pub fn new(
-        cameras: Vec<Camera>,
-        stream_manager_handle: StreamManagerHandle,
-        layout_path: PathBuf,
-    ) -> Self {
-        let statuses = cameras
-            .iter()
-            .map(|camera| (camera.rtsp_url.clone(), ConnectionStatus::Disconnected))
-            .collect();
-
+    pub fn new(library: CameraLibrary, stream_manager_handle: StreamManagerHandle) -> Self {
         let mut app = Self {
-            streams: HashMap::with_capacity(cameras.len()),
-            cameras,
+            cameras: Vec::new(),
+            streams: HashMap::new(),
             textures: HashMap::new(),
-            statuses,
+            statuses: HashMap::new(),
             drag_state: None,
             enlarged: None,
             enlarged_since: None,
             stream_manager_handle,
-            layout_path,
+            library,
+            dialog: None,
+            notice: None,
             look: Look::new(true),
         };
-        app.sync_streams();
+        app.rebuild_cameras();
         app
+    }
+
+    /// Rebuilds the cameras from the library (after adding, editing, removing
+    /// or changing a login): drops the state of the cameras that left and opens
+    /// or switches the streams of what changed.
+    fn rebuild_cameras(&mut self) {
+        self.cameras = self.library.cameras();
+        let ids: HashSet<String> = self
+            .cameras
+            .iter()
+            .map(|camera| camera.id.clone())
+            .collect();
+
+        let removed: Vec<String> = self
+            .streams
+            .keys()
+            .filter(|id| !ids.contains(*id))
+            .cloned()
+            .collect();
+        for id in removed {
+            if let Some(stream) = self.streams.remove(&id) {
+                self.stream_manager_handle.remove_stream(stream.url);
+            }
+        }
+        self.textures.retain(|id, _| ids.contains(id));
+        self.statuses.retain(|id, _| ids.contains(id));
+        for camera in &self.cameras {
+            self.statuses
+                .entry(camera.id.clone())
+                .or_insert(ConnectionStatus::Disconnected);
+        }
+        if self.enlarged.as_ref().is_some_and(|id| !ids.contains(id)) {
+            self.enlarged = None;
+        }
+        self.sync_streams();
     }
 
     /// Applies the Windows 11 look when the window is created: system fonts,
@@ -338,7 +402,7 @@ impl SimpleRtspViewerApp {
             .cameras
             .iter()
             .filter_map(|camera| {
-                let key = &camera.rtsp_url;
+                let key = &camera.id;
                 let wanted = camera.stream_url(self.enlarged.as_ref() == Some(key));
                 let current = self.streams.get(key).map(|stream| stream.url.as_str());
                 (current != Some(wanted)).then(|| (key.clone(), wanted.to_string()))
@@ -407,9 +471,7 @@ impl SimpleRtspViewerApp {
     /// Index, in `cameras`, of the enlarged camera.
     fn enlarged_index(&self) -> Option<usize> {
         let key = self.enlarged.as_ref()?;
-        self.cameras
-            .iter()
-            .position(|camera| &camera.rtsp_url == key)
+        self.cameras.iter().position(|camera| &camera.id == key)
     }
 
     /// Tells the `StreamTask` of camera `key` the size at which it is shown, so
@@ -435,7 +497,7 @@ impl SimpleRtspViewerApp {
     fn drain_camera_events(&mut self, ctx: &egui::Context) -> bool {
         let mut received_any = false;
         for camera in &self.cameras {
-            let key = &camera.rtsp_url;
+            let key = &camera.id;
             let Some(stream) = self.streams.get_mut(key) else {
                 continue;
             };
@@ -505,58 +567,71 @@ impl SimpleRtspViewerApp {
             .fill(panel_fill)
             .inner_margin(egui::Margin::same(GAP));
 
+        // With a dialog open, the grid is inactive (as in a modal window).
+        let interactive = self.dialog.is_none();
         egui::CentralPanel::default().frame(panel).show(ctx, |ui| {
-            if self.cameras.is_empty() {
-                self.paint_empty_state(ui);
-                return;
-            }
-
-            if let Some(index) = self.enlarged_index() {
-                self.enlarged_block(ui, index);
-                return;
-            }
-
-            let (columns, rows) = grid::grid_dimensions(self.cameras.len());
-            let available = ui.available_size();
-            // The gaps between the tiles come out of the available size, so the
-            // grid fits the panel exactly.
-            let cell_size = egui::vec2(
-                ((available.x - GAP * (columns - 1) as f32) / columns as f32).max(1.0),
-                ((available.y - GAP * (rows - 1) as f32) / rows as f32).max(1.0),
-            );
-
-            let mut reorder: Option<(usize, usize)> = None;
-            let mut enlarge: Option<usize> = None;
-
-            egui::Grid::new("camera_grid")
-                .min_col_width(cell_size.x)
-                .min_row_height(cell_size.y)
-                .spacing(egui::vec2(GAP, GAP))
-                .show(ui, |ui| {
-                    for row in 0..rows {
-                        for col in 0..columns {
-                            let index = row * columns + col;
-                            if index >= self.cameras.len() {
-                                ui.label("");
-                                continue;
-                            }
-                            match self.camera_block(ui, index, cell_size) {
-                                BlockAction::None => {}
-                                BlockAction::Drop { from, to } => reorder = Some((from, to)),
-                                BlockAction::Enlarge => enlarge = Some(index),
-                            }
-                        }
-                        ui.end_row();
-                    }
-                });
-
-            if let Some((from, to)) = reorder {
-                self.apply_reorder(from, to);
-            } else if let Some(index) = enlarge {
-                let key = self.cameras[index].rtsp_url.clone();
-                self.set_enlarged(Some(key));
-            }
+            ui.add_enabled_ui(interactive, |ui| self.grid_contents(ui));
         });
+    }
+
+    /// Content of the central panel: empty screen, enlarged camera or the grid.
+    fn grid_contents(&mut self, ui: &mut egui::Ui) {
+        if self.cameras.is_empty() {
+            self.paint_empty_state(ui);
+            return;
+        }
+
+        if let Some(index) = self.enlarged_index() {
+            self.enlarged_block(ui, index);
+            return;
+        }
+
+        let (columns, rows) = grid::grid_dimensions(self.cameras.len());
+        let available = ui.available_size();
+        // The gaps between the tiles come out of the available size, so the
+        // grid fits the panel exactly.
+        let cell_size = egui::vec2(
+            ((available.x - GAP * (columns - 1) as f32) / columns as f32).max(1.0),
+            ((available.y - GAP * (rows - 1) as f32) / rows as f32).max(1.0),
+        );
+
+        let mut action: Option<(usize, BlockAction)> = None;
+
+        egui::Grid::new("camera_grid")
+            .min_col_width(cell_size.x)
+            .min_row_height(cell_size.y)
+            .spacing(egui::vec2(GAP, GAP))
+            .show(ui, |ui| {
+                for row in 0..rows {
+                    for col in 0..columns {
+                        let index = row * columns + col;
+                        if index >= self.cameras.len() {
+                            ui.label("");
+                            continue;
+                        }
+                        let block_action = self.camera_block(ui, index, cell_size);
+                        if !matches!(block_action, BlockAction::None) {
+                            action = Some((index, block_action));
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+
+        let Some((index, action)) = action else {
+            return;
+        };
+        let id = self.cameras[index].id.clone();
+        match action {
+            BlockAction::None => {}
+            BlockAction::Drop { from, to } => self.apply_reorder(from, to),
+            BlockAction::Enlarge => self.set_enlarged(Some(id)),
+            BlockAction::Edit => self.open_edit_dialog(&id),
+            BlockAction::Remove => {
+                let label = self.camera_label(&id);
+                self.dialog = Some(Dialog::ConfirmRemove { id, label });
+            }
+        }
     }
 
     /// Draws the enlarged camera filling the whole panel. Double-click or Esc
@@ -566,7 +641,10 @@ impl SimpleRtspViewerApp {
         self.paint_camera(ui, index, rect);
         self.paint_enlarged_hint(ui, rect);
 
-        if response.double_clicked() || ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+        // With a dialog open the area is inactive and Esc belongs to the
+        // dialog.
+        let escape = ui.is_enabled() && ui.input(|input| input.key_pressed(egui::Key::Escape));
+        if response.double_clicked() || escape {
             self.set_enlarged(None);
         }
     }
@@ -641,7 +719,7 @@ impl SimpleRtspViewerApp {
         painter.text(
             egui::pos2(center_x, y),
             egui::Align2::CENTER_CENTER,
-            "No cameras loaded",
+            "No cameras yet",
             theme::semibold(20.0),
             palette.text,
         );
@@ -649,16 +727,16 @@ impl SimpleRtspViewerApp {
         painter.text(
             egui::pos2(center_x, y),
             egui::Align2::CENTER_CENTER,
-            "Open the app passing a camera file:",
+            "Use \"Scan network\" to find your cameras,",
             egui::FontId::proportional(14.0),
             palette.text_secondary,
         );
-        y += 24.0;
+        y += 22.0;
         painter.text(
             egui::pos2(center_x, y),
             egui::Align2::CENTER_CENTER,
-            "simple-rtsp-viewer.exe cameras.json",
-            egui::FontId::monospace(13.0),
+            "or \"Add camera\" to enter the address of one.",
+            egui::FontId::proportional(14.0),
             palette.text_secondary,
         );
     }
@@ -667,7 +745,7 @@ impl SimpleRtspViewerApp {
     /// which it is shown.
     fn paint_camera(&self, ui: &egui::Ui, index: usize, rect: egui::Rect) {
         let camera = &self.cameras[index];
-        let key = &camera.rtsp_url;
+        let key = &camera.id;
         let status = self
             .statuses
             .get(key)
@@ -704,6 +782,28 @@ impl SimpleRtspViewerApp {
         let response = response.interact(egui::Sense::click());
         if response.double_clicked() {
             return BlockAction::Enlarge;
+        }
+
+        // Context menu (right button), as on Windows items.
+        let mut menu_action = None;
+        response.context_menu(|ui| {
+            ui.set_min_width(160.0);
+            if ui.button("Enlarge").clicked() {
+                menu_action = Some(BlockAction::Enlarge);
+                ui.close_menu();
+            }
+            if ui.button("Edit…").clicked() {
+                menu_action = Some(BlockAction::Edit);
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button("Remove…").clicked() {
+                menu_action = Some(BlockAction::Remove);
+                ui.close_menu();
+            }
+        });
+        if let Some(action) = menu_action {
+            return action;
         }
 
         // Border a little more visible when hovered, as on Windows 11 cards.
@@ -844,7 +944,7 @@ impl SimpleRtspViewerApp {
     }
 
     /// Applies the `from`/`to` position swap to `self.cameras` and, if the
-    /// order actually changed, triggers the async layout persistence
+    /// order actually changed, takes the new order to the library and saves it
     /// (Requirements 4.4, 5.1). If `to` is invalid or equal to `from`,
     /// `grid::reorder` already returns the original list unchanged and no write
     /// is triggered.
@@ -853,36 +953,495 @@ impl SimpleRtspViewerApp {
         self.cameras = reordered;
 
         if changed {
-            self.persist_layout();
+            let position: HashMap<&str, usize> = self
+                .cameras
+                .iter()
+                .enumerate()
+                .map(|(index, camera)| (camera.id.as_str(), index))
+                .collect();
+            self.library.data.cameras.sort_by_key(|camera| {
+                position
+                    .get(camera.id.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            });
+            self.persist_library();
         }
     }
 
-    /// Triggers the async (fire-and-forget) write of the `Layout_Config_File`
-    /// reflecting the current order of `self.cameras`, without blocking the UI thread
-    /// (Requirement 5.1). The disk write (`layout::save_json_atomically`, synchronous)
-    /// runs on a thread of tokio's blocking pool via `spawn_blocking`; failures are
-    /// only logged, without interrupting the app (Requirement 5.7).
-    fn persist_layout(&self) {
-        let layout_path = self.layout_path.clone();
-        let layout_file = layout::build_layout_file(&self.cameras);
+    /// Triggers the async (fire-and-forget) write of the camera library,
+    /// without blocking the UI thread (Requirement 5.1). The disk write runs on
+    /// a thread of tokio's blocking pool via `spawn_blocking`; failures are
+    /// logged, without interrupting the app (Requirement 5.7).
+    fn persist_library(&self) {
+        let path = self.library.path.clone();
+        let data = self.library.data.clone();
 
         tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                layout::save_json_atomically(&layout_path, &layout_file)
-            })
-            .await;
+            let result = tokio::task::spawn_blocking(move || store::save(&path, &data)).await;
 
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
-                    tracing::error!(error = %err, "failed to save the layout file");
+                    tracing::error!(error = %err, "failed to save the camera list");
                 }
                 Err(join_err) => {
-                    tracing::error!(error = %join_err, "failed to run the background layout write");
+                    tracing::error!(error = %join_err, "failed to run the background camera list write");
                 }
             }
         });
     }
+
+    /// Camera name for messages (or the address, if it has no name).
+    fn camera_label(&self, id: &str) -> String {
+        self.library
+            .data
+            .cameras
+            .iter()
+            .find(|camera| camera.id == id)
+            .map(|camera| camera.name.clone().unwrap_or_else(|| camera.address()))
+            .unwrap_or_default()
+    }
+
+    fn open_edit_dialog(&mut self, id: &str) {
+        if let Some(camera) = self
+            .library
+            .data
+            .cameras
+            .iter()
+            .find(|camera| camera.id == id)
+        {
+            let own = self.library.own.get(id);
+            self.dialog = Some(Dialog::Camera(CameraForm::edit(camera, own)));
+        }
+    }
+
+    fn show_notice(&mut self, kind: NoticeKind, text: impl Into<String>) {
+        self.notice = Some(Notice {
+            kind,
+            text: text.into(),
+            since: Instant::now(),
+        });
+    }
+
+    /// Runs a command from the command bar.
+    fn run_command(&mut self, command: Command) {
+        let defaults = &self.library.data.scan;
+        match command {
+            Command::AddCamera => self.dialog = Some(Dialog::Camera(CameraForm::new(defaults))),
+            Command::Scan => self.dialog = Some(Dialog::Scan(ScanDialog::new(defaults))),
+            Command::SharedLogin => {
+                self.dialog = Some(Dialog::SharedLogin(LoginForm::new(
+                    self.library.shared.as_ref(),
+                )));
+            }
+            Command::Import => self.import_file(),
+        }
+    }
+
+    /// "Import": picks a camera file (the `cameras.json` format) and merges its
+    /// cameras into the library.
+    fn import_file(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Import cameras")
+            .add_filter("JSON", &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+        match import::load_import_file(&path) {
+            Ok(outcome) => {
+                let had_shared = self.library.shared.is_some();
+                let merge = store::merge_imported(
+                    &mut self.library.data,
+                    &outcome.cameras,
+                    &mut self.library.shared,
+                );
+                let mut problems = Vec::new();
+                if merge.shared_defined {
+                    if let Some(shared) = &self.library.shared {
+                        if let Err(err) = credentials::save_shared(shared) {
+                            problems.push(err);
+                        }
+                    }
+                }
+                for (id, login) in merge.own {
+                    if let Err(err) = credentials::save_for_camera(&id, &login) {
+                        problems.push(err);
+                    }
+                    self.library.own.insert(id, login);
+                }
+                self.persist_library();
+                self.rebuild_cameras();
+
+                if let Some(problem) = problems.first() {
+                    self.show_notice(
+                        NoticeKind::Error,
+                        format!("Cameras imported, but the login was not saved: {problem}"),
+                    );
+                } else {
+                    let mut text = format!("{} camera(s) imported", merge.added);
+                    if merge.duplicates > 0 {
+                        text.push_str(&format!(", {} were already in the list", merge.duplicates));
+                    }
+                    if outcome.rejected_count > 0 {
+                        text.push_str(&format!(", {} invalid entry(ies)", outcome.rejected_count));
+                    }
+                    if merge.shared_defined && !had_shared {
+                        text.push_str(". The login from the URLs became the default login");
+                    }
+                    text.push('.');
+                    self.show_notice(NoticeKind::Success, text);
+                }
+            }
+            Err(err) => self.show_notice(NoticeKind::Error, format!("Could not import: {err}")),
+        }
+    }
+
+    /// Applies what the user confirmed in a dialog.
+    fn apply_dialog_action(&mut self, action: DialogAction) {
+        match action {
+            DialogAction::None => return,
+            DialogAction::Close => {}
+            DialogAction::SaveCamera { camera, own } => {
+                let id = camera.id.clone();
+                let label = camera.name.clone().unwrap_or_else(|| camera.address());
+                let login_saved = match &own {
+                    Some(login) => credentials::save_for_camera(&id, login),
+                    None => credentials::delete_for_camera(&id),
+                };
+                match own {
+                    Some(login) => {
+                        self.library.own.insert(id.clone(), login);
+                    }
+                    None => {
+                        self.library.own.remove(&id);
+                    }
+                }
+
+                let cameras = &mut self.library.data.cameras;
+                let edited = match cameras.iter_mut().find(|existing| existing.id == id) {
+                    Some(existing) => {
+                        let moved = !existing.same_stream(&camera);
+                        *existing = camera;
+                        Some(moved)
+                    }
+                    None => {
+                        cameras.push(camera);
+                        None
+                    }
+                };
+                // New address: the last frame and status belonged to the old
+                // camera.
+                if edited == Some(true) {
+                    self.textures.remove(&id);
+                    self.statuses.remove(&id);
+                }
+                self.persist_library();
+                self.rebuild_cameras();
+
+                match login_saved {
+                    Err(err) => self.show_notice(
+                        NoticeKind::Error,
+                        format!("\"{label}\" was saved, but the login was not: {err}"),
+                    ),
+                    Ok(()) if edited.is_some() => {
+                        self.show_notice(NoticeKind::Success, format!("\"{label}\" updated."))
+                    }
+                    Ok(()) => self.show_notice(NoticeKind::Success, format!("\"{label}\" added.")),
+                }
+            }
+            DialogAction::SaveSharedLogin(login) => match credentials::save_shared(&login) {
+                Ok(()) => {
+                    self.library.shared = Some(login);
+                    self.rebuild_cameras();
+                    self.show_notice(
+                        NoticeKind::Success,
+                        "Default login saved to the Windows Credential Manager.",
+                    );
+                }
+                Err(err) => {
+                    self.show_notice(NoticeKind::Error, format!("The login was not saved: {err}"));
+                    return;
+                }
+            },
+            DialogAction::AddCameras { cameras, scan } => {
+                let added = cameras.len();
+                self.library.data.cameras.extend(cameras);
+                self.library.data.scan = scan;
+                self.persist_library();
+                self.rebuild_cameras();
+                self.show_notice(NoticeKind::Success, format!("{added} camera(s) added."));
+            }
+            DialogAction::RemoveCamera(id) => {
+                let label = self.camera_label(&id);
+                self.library.data.cameras.retain(|camera| camera.id != id);
+                if self.library.own.remove(&id).is_some() {
+                    if let Err(err) = credentials::delete_for_camera(&id) {
+                        tracing::warn!(error = %err, "the removed camera's own login was not deleted from the vault");
+                    }
+                }
+                self.persist_library();
+                self.rebuild_cameras();
+                self.show_notice(NoticeKind::Success, format!("\"{label}\" removed."));
+            }
+        }
+        self.dialog = None;
+    }
+
+    /// Command bar at the top: title, camera count and the actions.
+    fn draw_command_bar(&mut self, ctx: &egui::Context) {
+        let palette = self.look.palette;
+        let icons = self.look.icons;
+        let bar = egui::Frame::none()
+            .fill(self.panel_fill())
+            .inner_margin(egui::Margin {
+                left: GAP + 8.0,
+                right: GAP,
+                top: GAP + 2.0,
+                bottom: 0.0,
+            });
+
+        let mut command = None;
+        egui::TopBottomPanel::top("command_bar")
+            .frame(bar)
+            .show_separator_line(false)
+            .show(ctx, |ui| {
+                ui.add_enabled_ui(self.dialog.is_none(), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Cameras")
+                                .font(theme::semibold(18.0))
+                                .color(palette.text),
+                        );
+                        let total = self.cameras.len();
+                        if total > 0 {
+                            ui.label(
+                                egui::RichText::new(format!("{total}"))
+                                    .color(palette.text_secondary),
+                            );
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let text = palette.text;
+                            if ui
+                                .add(command_button(
+                                    theme::ICON_KEY,
+                                    "Default login",
+                                    icons,
+                                    text,
+                                ))
+                                .clicked()
+                            {
+                                command = Some(Command::SharedLogin);
+                            }
+                            if ui
+                                .add(command_button(theme::ICON_IMPORT, "Import", icons, text))
+                                .clicked()
+                            {
+                                command = Some(Command::Import);
+                            }
+                            if ui
+                                .add(command_button(
+                                    theme::ICON_SEARCH,
+                                    "Scan network",
+                                    icons,
+                                    text,
+                                ))
+                                .clicked()
+                            {
+                                command = Some(Command::Scan);
+                            }
+                            let add = dialogs::accent_button("Add camera", &palette);
+                            if ui.add(add).clicked() {
+                                command = Some(Command::AddCamera);
+                            }
+                        });
+                    });
+                });
+            });
+
+        if let Some(command) = command {
+            self.run_command(command);
+        }
+    }
+
+    /// Notice bar (Windows 11 InfoBar) below the command bar: the missing
+    /// default login or the app's last message.
+    fn draw_notice_bar(&mut self, ctx: &egui::Context) {
+        if self.notice.as_ref().is_some_and(|notice| {
+            notice.kind == NoticeKind::Success && notice.since.elapsed() > NOTICE_DURATION
+        }) {
+            self.notice = None;
+        }
+
+        let palette = self.look.palette;
+        let icons = self.look.icons;
+        let missing_login = self.library.missing_shared_login();
+        if self.notice.is_none() && !missing_login {
+            return;
+        }
+
+        let mut define_login = false;
+        let mut dismiss = false;
+        egui::TopBottomPanel::top("notice_bar")
+            .frame(
+                egui::Frame::none()
+                    .fill(self.panel_fill())
+                    .inner_margin(egui::Margin {
+                        left: GAP,
+                        right: GAP,
+                        top: GAP,
+                        bottom: 0.0,
+                    }),
+            )
+            .show_separator_line(false)
+            .show(ctx, |ui| {
+                ui.add_enabled_ui(self.dialog.is_none(), |ui| {
+                    let (kind, text) = match &self.notice {
+                        Some(notice) => (notice.kind, notice.text.as_str()),
+                        None => (
+                            NoticeKind::Error,
+                            "Set the default login so the app can connect to the cameras.",
+                        ),
+                    };
+                    let (fill, icon, icon_color) = match kind {
+                        NoticeKind::Success => (
+                            palette.notice_success,
+                            theme::ICON_SUCCESS,
+                            palette.success_text,
+                        ),
+                        NoticeKind::Error if self.notice.is_none() => {
+                            (palette.notice_info, theme::ICON_INFO, palette.accent)
+                        }
+                        NoticeKind::Error => (
+                            palette.notice_error,
+                            theme::ICON_WARNING,
+                            palette.critical_text,
+                        ),
+                    };
+                    egui::Frame::none()
+                        .fill(fill)
+                        .stroke(egui::Stroke::new(1.0_f32, palette.control_stroke))
+                        .rounding(4.0)
+                        .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if icons {
+                                    ui.label(
+                                        egui::RichText::new(icon)
+                                            .font(theme::icon_font(16.0))
+                                            .color(icon_color),
+                                    );
+                                }
+                                ui.label(egui::RichText::new(text).color(palette.text));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if self.notice.is_some() {
+                                            let close = if icons {
+                                                egui::Button::new(
+                                                    egui::RichText::new(theme::ICON_CLOSE)
+                                                        .font(theme::icon_font(12.0)),
+                                                )
+                                            } else {
+                                                egui::Button::new("Close")
+                                            };
+                                            if ui.add(close.frame(false)).clicked() {
+                                                dismiss = true;
+                                            }
+                                        } else if ui.button("Set login").clicked() {
+                                            define_login = true;
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                });
+            });
+
+        if dismiss {
+            self.notice = None;
+        }
+        if define_login {
+            self.run_command(Command::SharedLogin);
+        }
+        if self.notice.is_some() {
+            // So the success message goes away at the right time.
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+    }
+
+    /// Open dialog, over the darkened rest of the window.
+    fn draw_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.dialog.as_mut() else {
+            return;
+        };
+
+        // Darkens the window behind the dialog, above the panels and below the
+        // egui windows.
+        let screen = ctx.screen_rect();
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::PanelResizeLine,
+            egui::Id::new("dialog_scrim"),
+        ))
+        .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(110));
+
+        let env = DialogEnv {
+            palette: &self.look.palette,
+            shared: self.library.shared.as_ref(),
+            cameras: &self.library.data.cameras,
+        };
+        let action = dialog.show(ctx, &env);
+        self.apply_dialog_action(action);
+    }
+
+    /// Panel background: transparent with Mica, the theme color without it.
+    fn panel_fill(&self) -> egui::Color32 {
+        if self.look.mica {
+            egui::Color32::TRANSPARENT
+        } else {
+            self.look.palette.window_background
+        }
+    }
+}
+
+/// Command bar button: Windows icon (if the font exists) and text.
+fn command_button(
+    icon: &str,
+    text: &str,
+    icons: bool,
+    color: egui::Color32,
+) -> egui::Button<'static> {
+    let label: egui::WidgetText = if icons {
+        // A text with two fonts (icon and text); the colors of a `LayoutJob` do
+        // not come from the theme, so the color is passed in.
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            icon,
+            0.0,
+            egui::TextFormat {
+                font_id: theme::icon_font(14.0),
+                color,
+                valign: egui::Align::Center,
+                ..Default::default()
+            },
+        );
+        job.append(
+            text,
+            8.0,
+            egui::TextFormat {
+                font_id: egui::FontId::proportional(14.0),
+                color,
+                valign: egui::Align::Center,
+                ..Default::default()
+            },
+        );
+        job.into()
+    } else {
+        text.to_owned().into()
+    };
+    egui::Button::new(label).min_size(egui::vec2(0.0, 32.0))
 }
 
 impl eframe::App for SimpleRtspViewerApp {
@@ -906,7 +1465,12 @@ impl eframe::App for SimpleRtspViewerApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.sync_theme(ctx, frame);
         let received_update = self.drain_camera_events(ctx);
+        self.draw_command_bar(ctx);
+        self.draw_notice_bar(ctx);
         self.draw_grid(ctx);
+        // Last: the grid sees the open dialog and stays inactive in this frame,
+        // even if the dialog closes now (e.g. Esc belongs only to the dialog).
+        self.draw_dialog(ctx);
 
         // Avoids a continuous repaint busy-loop (which would keep CPU/GPU
         // always busy, against Requirements 7.2/7.3). egui already schedules an
@@ -935,6 +1499,7 @@ impl eframe::App for SimpleRtspViewerApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::CameraAuth;
     use proptest::prelude::*;
 
     fn camera(url: &str) -> Camera {
@@ -944,6 +1509,42 @@ mod tests {
             name: None,
             substream_url: None,
         }
+    }
+
+    fn stored(id: &str, main_path: &str, sub_path: Option<&str>) -> store::StoredCamera {
+        // Port 1 on localhost: without a server, the StreamTasks just keep
+        // trying to connect.
+        store::StoredCamera {
+            id: id.to_string(),
+            name: None,
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            main_path: main_path.to_string(),
+            sub_path: sub_path.map(str::to_string),
+            auth: CameraAuth::None,
+        }
+    }
+
+    /// Test app with the given library, inside a tokio runtime.
+    fn with_app(cameras: Vec<store::StoredCamera>, test: impl FnOnce(&mut SimpleRtspViewerApp)) {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create the test runtime");
+        let guard = runtime.enter();
+        let handle = StreamManagerHandle::new();
+        let library = CameraLibrary {
+            path: std::env::temp_dir().join("library_ui_test_unused.json"),
+            data: store::StoreData {
+                cameras,
+                scan: store::ScanSettings::default(),
+            },
+            shared: None,
+            own: HashMap::new(),
+        };
+        let mut app = SimpleRtspViewerApp::new(library, handle.clone());
+        test(&mut app);
+        drop(app);
+        runtime.block_on(handle.shutdown());
+        drop(guard);
+        runtime.shutdown_timeout(Duration::from_secs(2));
     }
 
     #[test]
@@ -975,48 +1576,87 @@ mod tests {
         );
     }
 
+    fn open_url(app: &SimpleRtspViewerApp, id: &str) -> String {
+        app.streams[id].url.clone()
+    }
+
     #[test]
     fn enlarging_switches_only_that_camera_to_the_main_stream() {
-        // Addresses without a server: the StreamTasks just keep trying to
-        // connect.
-        let with_substream = Camera {
-            id: "a".to_string(),
-            rtsp_url: "rtsp://127.0.0.1:1/main-a".to_string(),
-            name: None,
-            substream_url: Some("rtsp://127.0.0.1:1/sub-a".to_string()),
-        };
-        let without_substream = camera("rtsp://127.0.0.1:1/main-b");
-        let key_a = with_substream.rtsp_url.clone();
-        let key_b = without_substream.rtsp_url.clone();
+        let cameras = vec![
+            stored("a", "/main-a", Some("/sub-a")),
+            stored("b", "/main-b", None),
+        ];
+        with_app(cameras, |app| {
+            // In the grid: substream when there is one, main stream when not.
+            assert_eq!(open_url(app, "a"), "rtsp://127.0.0.1:1/sub-a");
+            assert_eq!(open_url(app, "b"), "rtsp://127.0.0.1:1/main-b");
 
-        let runtime = tokio::runtime::Runtime::new().expect("failed to create the test runtime");
-        let guard = runtime.enter();
-        let handle = StreamManagerHandle::new();
-        let mut app = SimpleRtspViewerApp::new(
-            vec![with_substream, without_substream],
-            handle.clone(),
-            std::env::temp_dir().join("layout_ui_test_unused.json"),
-        );
-        let open_url = |app: &SimpleRtspViewerApp, key: &str| app.streams[key].url.clone();
+            // Enlarged: only camera A switches to the main stream.
+            app.set_enlarged(Some("a".to_string()));
+            assert_eq!(app.enlarged_index(), Some(0));
+            assert_eq!(open_url(app, "a"), "rtsp://127.0.0.1:1/main-a");
+            assert_eq!(open_url(app, "b"), "rtsp://127.0.0.1:1/main-b");
 
-        // In the grid: substream when there is one, main stream when not.
-        assert_eq!(open_url(&app, &key_a), "rtsp://127.0.0.1:1/sub-a");
-        assert_eq!(open_url(&app, &key_b), key_b);
+            // Back to the grid: A goes back to the substream.
+            app.set_enlarged(None);
+            assert_eq!(app.enlarged_index(), None);
+            assert_eq!(open_url(app, "a"), "rtsp://127.0.0.1:1/sub-a");
+        });
+    }
 
-        // Enlarged: only camera A switches to the main stream.
-        app.set_enlarged(Some(key_a.clone()));
-        assert_eq!(app.enlarged_index(), Some(0));
-        assert_eq!(open_url(&app, &key_a), key_a);
-        assert_eq!(open_url(&app, &key_b), key_b);
+    #[test]
+    fn library_changes_open_close_and_switch_streams() {
+        with_app(vec![stored("a", "/main-a", None)], |app| {
+            // New camera: opens its stream.
+            app.library.data.cameras.push(stored("b", "/main-b", None));
+            app.rebuild_cameras();
+            assert_eq!(open_url(app, "b"), "rtsp://127.0.0.1:1/main-b");
 
-        // Back to the grid: A goes back to the substream.
-        app.set_enlarged(None);
-        assert_eq!(app.enlarged_index(), None);
-        assert_eq!(open_url(&app, &key_a), "rtsp://127.0.0.1:1/sub-a");
+            // Edited camera (another path): switches the stream, same `id`.
+            app.library.data.cameras[1].main_path = "/new-b".to_string();
+            app.rebuild_cameras();
+            assert_eq!(open_url(app, "b"), "rtsp://127.0.0.1:1/new-b");
 
-        runtime.block_on(handle.shutdown());
-        drop(guard);
-        runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+            // Removed enlarged camera: closes the stream and goes back to the
+            // grid.
+            app.set_enlarged(Some("a".to_string()));
+            app.library.data.cameras.retain(|camera| camera.id != "a");
+            app.rebuild_cameras();
+            assert!(!app.streams.contains_key("a"));
+            assert!(!app.statuses.contains_key("a"));
+            assert_eq!(app.enlarged, None);
+            assert_eq!(app.cameras.len(), 1);
+        });
+    }
+
+    #[test]
+    fn reorder_is_mirrored_in_the_library() {
+        let cameras = vec![
+            stored("a", "/a", None),
+            stored("b", "/b", None),
+            stored("c", "/c", None),
+        ];
+        with_app(cameras, |app| {
+            app.library.path = std::env::temp_dir().join(format!(
+                "library_ui_reorder_{}.json",
+                store::new_camera_id()
+            ));
+            app.apply_reorder(0, 2);
+            let ids: Vec<&str> = app
+                .library
+                .data
+                .cameras
+                .iter()
+                .map(|camera| camera.id.as_str())
+                .collect();
+            assert_eq!(ids, ["c", "b", "a"]);
+            let shown: Vec<&str> = app
+                .cameras
+                .iter()
+                .map(|camera| camera.id.as_str())
+                .collect();
+            assert_eq!(shown, ["c", "b", "a"]);
+        });
     }
 
     fn rect(x: f32, y: f32, w: f32, h: f32) -> egui::Rect {

@@ -1,4 +1,5 @@
 mod credentials;
+mod dialogs;
 mod discovery;
 mod grid;
 mod import;
@@ -10,43 +11,33 @@ mod streaming;
 mod theme;
 mod ui;
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use store::{CameraAuth, CameraLibrary, StoreData};
 use streaming::StreamManagerHandle;
 use ui::SimpleRtspViewerApp;
 
-/// Maximum time the shutdown waits for the camera threads (and a layout write
-/// that may be in progress) to finish before abandoning them.
+/// Maximum time the shutdown waits for the camera threads (and a write that may
+/// be in progress) to finish before abandoning them.
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
-/// Path of the Layout_Config_File kept by the System (Requirement 5).
-///
-/// Kept in the current working directory for simplicity at this stage of the
-/// project; it can move to a platform-specific configuration directory in a
-/// future iteration without affecting the pure functions of `layout` (which
-/// take the path as a parameter).
-fn layout_file_path() -> PathBuf {
-    PathBuf::from("layout.json")
-}
+/// Files from the previous version, which kept the cameras (with the password
+/// in the URLs) and the grid order in the current folder. They are imported
+/// only once, on the first run with the app's library.
+const LEGACY_CAMERAS_FILE: &str = "cameras.json";
+const LEGACY_LAYOUT_FILE: &str = "layout.json";
 
-/// Determines the Import_File to load (Requirement 1.1).
-///
-/// Prefers the first command-line argument, when given (`simple-rtsp-viewer
-/// path/cameras.json`): this allows using the System in environments without a
-/// native file picker (headless, SSH, or without `xdg-desktop-portal`/`zenity`
-/// installed). Without the argument, it falls back to the native file dialog;
-/// returns `None` if the dialog is not available or the user cancels the
-/// selection.
-fn pick_import_file() -> Option<PathBuf> {
+/// Camera file to import on startup (Requirement 1.1): the one passed on the
+/// command line (`simple-rtsp-viewer path/cameras.json`) or, on the first run,
+/// the previous version's `cameras.json` in the current folder.
+fn import_source(first_run: bool) -> Option<PathBuf> {
     if let Some(arg) = std::env::args_os().nth(1) {
         return Some(PathBuf::from(arg));
     }
-
-    rfd::FileDialog::new()
-        .set_title("Select the camera import file")
-        .add_filter("JSON", &["json"])
-        .pick_file()
+    let legacy = PathBuf::from(LEGACY_CAMERAS_FILE);
+    (first_run && legacy.is_file()).then_some(legacy)
 }
 
 /// Shows a native error message with the specific cause of the import failure,
@@ -93,49 +84,121 @@ fn show_import_summary(outcome: &import::ImportOutcome) {
         .show();
 }
 
-/// Loads the Import_File selected by `pick_import_file`, showing an error
-/// message with the specific cause on failure (Requirement 1.3) and a warning
-/// when entries were rejected or ignored (Requirements 1.5, 1.6, 1.7). If the
-/// user cancels the file selection, or if the import fails, returns an empty
-/// camera list (equivalent to keeping the previously loaded list unchanged,
-/// which is still empty at this startup stage).
-fn load_cameras() -> Vec<model::Camera> {
-    let Some(path) = pick_import_file() else {
-        tracing::warn!(
-            "no import file selected; starting without cameras. \
-             Pass the path as an argument: `simple-rtsp-viewer cameras.json`"
-        );
-        return Vec::new();
+/// Loads the app's camera library (`%APPDATA%`) and the logins from the Windows
+/// vault, first importing the camera file given by `import_source`, if any.
+fn load_library() -> CameraLibrary {
+    let path = store::default_store_path();
+    let (mut data, first_run) = match store::load(&path) {
+        Ok(Some(data)) => (data, false),
+        Ok(None) => (StoreData::default(), true),
+        Err(err) => {
+            // An unreadable file is not overwritten: it is set aside and the
+            // app starts with an empty list.
+            let backup = path.with_extension("json.unreadable");
+            let kept = std::fs::rename(&path, &backup).is_ok();
+            tracing::error!(error = %err, "unreadable camera list");
+            let mut description = format!("The camera list could not be read: {err}");
+            if kept {
+                description.push_str(&format!("\n\nThe file was saved to {}.", backup.display()));
+            }
+            rfd::MessageDialog::new()
+                .set_title("Unreadable camera list")
+                .set_description(description)
+                .set_level(rfd::MessageLevel::Error)
+                .show();
+            (StoreData::default(), false)
+        }
     };
 
-    match import::load_import_file(&path) {
-        Ok(outcome) => {
-            tracing::info!(
-                path = %path.display(),
-                loaded = outcome.cameras.len(),
-                rejected = outcome.rejected_count,
-                truncated = outcome.truncated,
-                "camera import finished"
-            );
-            show_import_summary(&outcome);
-            outcome.cameras
-        }
+    let mut shared = credentials::load_shared().unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "the default login could not be read from the vault");
+        None
+    });
+
+    if let Some(source) = import_source(first_run) {
+        import_into_library(&mut data, &mut shared, &source, first_run, &path);
+    }
+
+    let own: HashMap<String, credentials::Credentials> = data
+        .cameras
+        .iter()
+        .filter(|camera| camera.auth == CameraAuth::Own)
+        .filter_map(|camera| match credentials::load_for_camera(&camera.id) {
+            Ok(login) => login.map(|login| (camera.id.clone(), login)),
+            Err(err) => {
+                tracing::warn!(error = %err, "a camera's own login could not be read from the vault");
+                None
+            }
+        })
+        .collect();
+
+    CameraLibrary {
+        path,
+        data,
+        shared,
+        own,
+    }
+}
+
+/// Imports a camera file into the library (Requirements 1.1–1.7), moving the
+/// logins from the URLs to the Windows vault and saving the library. When
+/// migrating from the previous version (`first_run`), keeps the order of the
+/// old `layout.json`. Shows the specific error if the file cannot be read
+/// (Requirement 1.3) and a warning if entries were rejected.
+fn import_into_library(
+    data: &mut StoreData,
+    shared: &mut Option<credentials::Credentials>,
+    source: &Path,
+    first_run: bool,
+    store_path: &Path,
+) {
+    let outcome = match import::load_import_file(source) {
+        Ok(outcome) => outcome,
         Err(err) => {
-            tracing::error!(path = %path.display(), error = %err, "failed to import the camera file");
+            tracing::error!(path = %source.display(), error = %err, "failed to import the camera file");
             show_import_error(&err);
-            Vec::new()
+            return;
+        }
+    };
+    show_import_summary(&outcome);
+
+    let cameras = if first_run {
+        load_camera_order(outcome.cameras, Path::new(LEGACY_LAYOUT_FILE))
+    } else {
+        outcome.cameras
+    };
+    let merge = store::merge_imported(data, &cameras, shared);
+
+    if merge.shared_defined {
+        if let Some(login) = shared.as_ref() {
+            if let Err(err) = credentials::save_shared(login) {
+                tracing::error!(error = %err, "the imported default login was not saved to the vault");
+            }
         }
     }
+    for (id, login) in &merge.own {
+        if let Err(err) = credentials::save_for_camera(id, login) {
+            tracing::error!(error = %err, "an imported camera login was not saved to the vault");
+        }
+    }
+    if let Err(err) = store::save(store_path, data) {
+        tracing::error!(error = %err, "failed to save the camera list");
+    }
+
+    tracing::info!(
+        path = %source.display(),
+        adicionadas = merge.added,
+        repetidas = merge.duplicates,
+        rejected = outcome.rejected_count,
+        "cameras imported into the app's list"
+    );
 }
 
 /// Loads the saved order from the Layout_Config_File (if it exists and is
 /// valid) and reconciles it with the imported camera list, returning the final
 /// camera order (Requirements 5.2, 5.3, 5.4). A missing or corrupted layout
 /// file is handled the same way: the Import_File order is used as the default.
-fn load_camera_order(
-    imported: Vec<model::Camera>,
-    layout_path: &std::path::Path,
-) -> Vec<model::Camera> {
+fn load_camera_order(imported: Vec<model::Camera>, layout_path: &Path) -> Vec<model::Camera> {
     let saved_order = match layout::load_layout_file(layout_path) {
         Ok(layout_file) => layout_file.camera_order,
         Err(err) => {
@@ -163,9 +226,7 @@ fn main() -> eframe::Result {
         )
         .init();
 
-    let imported_cameras = load_cameras();
-    let layout_path = layout_file_path();
-    let cameras = load_camera_order(imported_cameras, &layout_path);
+    let library = load_library();
 
     // `StreamManagerHandle::new` and `SimpleRtspViewerApp::new` call
     // `tokio::spawn` internally (Requirement 3.1), so a tokio runtime must be
@@ -192,8 +253,7 @@ fn main() -> eframe::Result {
         native_options,
         Box::new(move |cc| {
             Ok(Box::new(
-                SimpleRtspViewerApp::new(cameras, stream_manager_handle, layout_path)
-                    .with_windows_look(cc),
+                SimpleRtspViewerApp::new(library, stream_manager_handle).with_windows_look(cc),
             ) as Box<dyn eframe::App>)
         }),
     );

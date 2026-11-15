@@ -1,6 +1,6 @@
 //! Domain types shared by the other modules.
 
-/// A camera loaded from the Import_File.
+/// Camera ready to display: full URLs, already with the login.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Camera {
     /// Stable camera id, which does not change when the address or the login

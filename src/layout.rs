@@ -1,4 +1,8 @@
-//! Layout_Persistence: reconciliation and persistence of the grid order.
+//! Layout_Persistence: reconciliation of the grid order and atomic writes of
+//! JSON files.
+//!
+//! The grid order now lives in the app's own camera list; the old `layout.json`
+//! is only read to keep the order when migrating a `cameras.json`.
 
 use std::fs;
 use std::path::Path;
@@ -49,17 +53,6 @@ pub fn restore_order(imported: &[Camera], saved_order: &[String]) -> Vec<Camera>
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LayoutFile {
     pub camera_order: Vec<String>,
-}
-
-/// Pure inverse of `restore_order`: extracts the current in-memory order into
-/// the persisted format.
-pub fn build_layout_file(current_order: &[Camera]) -> LayoutFile {
-    LayoutFile {
-        camera_order: current_order
-            .iter()
-            .map(|cam| cam.rtsp_url.clone())
-            .collect(),
-    }
 }
 
 /// Possible errors when loading the Layout_Config_File (Requirements 5.2, 5.4, 8.2).
@@ -310,13 +303,6 @@ mod tests {
         let imported = vec![cam("rtsp://a")];
         let saved = vec!["rtsp://x".to_string(), "rtsp://a".to_string()];
         assert_eq!(restore_order(&imported, &saved), vec![cam("rtsp://a")]);
-    }
-
-    #[test]
-    fn build_layout_file_extracts_urls_in_order() {
-        let cameras = vec![cam("rtsp://a"), cam("rtsp://b")];
-        let layout = build_layout_file(&cameras);
-        assert_eq!(layout.camera_order, vec!["rtsp://a", "rtsp://b"]);
     }
 
     #[test]

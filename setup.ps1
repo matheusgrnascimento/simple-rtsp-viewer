@@ -283,7 +283,7 @@ if (-not $SkipBuild) {
     Copy-Item -Path (Join-Path $ffBin "*.dll") -Destination $releaseDir -Force
     Write-Ok "FFmpeg DLLs copied to $releaseDir."
     Write-Host "`nTo run:" -ForegroundColor Cyan
-    Write-Host "    .\target\release\simple-rtsp-viewer.exe cameras.json" -ForegroundColor White
+    Write-Host "    .\target\release\simple-rtsp-viewer.exe" -ForegroundColor White
 }
 else {
     Write-Step "Build step skipped (-SkipBuild)"
