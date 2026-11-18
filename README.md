@@ -4,7 +4,10 @@ Simple desktop viewer for watching multiple RTSP cameras in a grid. The project 
 
 ## Features
 
-- import of up to 64 cameras from a JSON file;
+- cameras managed by the app itself: add, edit and remove them from the interface;
+- local network discovery, testing each camera with the default login;
+- camera logins kept in the Windows Credential Manager, never in a file;
+- import of cameras from a JSON file;
 - simultaneous display of the streams in a responsive grid;
 - visual indicators for connected, reconnecting and failed streams;
 - automatic reconnection with progressive backoff when a stream drops;
@@ -14,8 +17,8 @@ Simple desktop viewer for watching multiple RTSP cameras in a grid. The project 
 - frames scaled down to their on-screen size during decoding, keeping the aspect ratio;
 - GPU video decoding (D3D11VA), falling back to the CPU automatically when the GPU does not support the video;
 - Windows 11 look: light/dark theme following the system, Windows accent color, Segoe fonts and Mica backdrop;
-- automatic persistence of the grid order in `layout.json`;
-- support for RTSP URLs with authentication, without exposing credentials in the logs.
+- grid order saved automatically;
+- support for cameras with authentication, without exposing credentials in the logs.
 
 ## Requirements
 
@@ -45,9 +48,21 @@ With `FFMPEG_DIR`, `LIBCLANG_PATH` (the `bin` folder of an LLVM 19 install, cont
 cargo build --release
 ```
 
-## Camera configuration
+## Cameras
 
-Create a JSON file with a list of cameras. The `url` field is required; `name` and `substream_url` are optional:
+Cameras are managed from the app's command bar:
+
+- **Default login**: username and password used by the cameras (and by the network scan). They are kept in the Windows Credential Manager as a generic credential of the "Simple RTSP Viewer" service.
+- **Scan network**: probes the RTSP port (554 by default) on every address of the local network, limited to 254 addresses per interface, and opens the video paths (`/stream1` and `/stream2` by default) with the default login. Cameras that respond are listed with their IP and resolution, and you choose which ones to add.
+- **Add camera**: address, port, main stream and substream paths, and the login (the default one, one for this camera only, or none). The "Test connection" button checks it before saving.
+- **Import**: merges the cameras from a JSON file (format below) into the list.
+- Right-click a camera to enlarge, edit or remove it.
+
+The list is stored in `%APPDATA%\Simple RTSP Viewer\cameras.json`, without any password, already in grid order.
+
+### Import file
+
+The import file is a JSON file with a list of cameras. The `url` field is required; `name` and `substream_url` are optional:
 
 ```json
 [
@@ -65,20 +80,20 @@ Create a JSON file with a list of cameras. The `url` field is required; `name` a
 
 `substream_url` points to the camera's secondary stream, which has a lower resolution (on TP-Link Tapo cameras, for example, `stream1` is the main stream and `stream2` the secondary one). The grid uses it, which cuts CPU and network usage considerably; the main stream is only opened when the camera is enlarged. Without `substream_url`, the camera always uses `url`. An invalid `substream_url` is ignored without dropping the camera.
 
-The `cameras.json` file is ignored by Git to avoid accidentally committing real addresses and credentials.
+On import, the login embedded in the URLs goes to the Credential Manager: the first login found becomes the default login (if there is none yet), and cameras with a different login get their own login. Cameras already in the list are skipped.
+
+On the first run, if there is a `cameras.json` in the current folder (the format of the previous version), it is imported automatically, keeping the order from `layout.json`. After that, these two files are no longer used; since the old `cameras.json` has the password in plain text, you should delete it. It is ignored by Git to avoid accidentally committing real addresses and credentials.
 
 ## Running
 
-Pass the camera file as the first argument:
-
-```bash
-cargo run --release -- cameras.json
+```powershell
+.\target\release\simple-rtsp-viewer.exe
 ```
 
-On Windows, after running the setup:
+A camera file passed as an argument is imported into the list on startup:
 
 ```powershell
-.\target\release\simple-rtsp-viewer.exe cameras.json
+.\target\release\simple-rtsp-viewer.exe other-cameras.json
 ```
 
 Two environment variables turn off features that depend on the video driver, useful to compare performance or to work around problems:
@@ -89,10 +104,8 @@ Two environment variables turn off features that depend on the video driver, use
 | `RTSP_VIEWER_MICA` | uses a solid background instead of Mica |
 
 ```powershell
-$env:RTSP_VIEWER_GPU_DECODE = "0"; .\target\release\simple-rtsp-viewer.exe cameras.json
+$env:RTSP_VIEWER_GPU_DECODE = "0"; .\target\release\simple-rtsp-viewer.exe
 ```
-
-If no path is given, the app opens the system file picker. The order set by drag and drop is saved to `layout.json` in the working directory and applied again on the next start.
 
 ## Tests
 
