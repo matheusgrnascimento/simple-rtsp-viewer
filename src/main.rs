@@ -217,6 +217,19 @@ fn load_camera_order(imported: Vec<model::Camera>, layout_path: &Path) -> Vec<mo
     layout::restore_order(&imported, &saved_order)
 }
 
+/// Window icon, shown in the title bar, the taskbar and Alt+Tab. Without it,
+/// eframe shows its default icon instead of the one embedded in the
+/// executable.
+fn app_icon() -> Option<egui::IconData> {
+    match eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
+        Ok(icon) => Some(icon),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to load the window icon");
+            None
+        }
+    }
+}
+
 fn main() -> eframe::Result {
     // Installs the `tracing` subscriber so the log events emitted by the other
     // modules (import, layout, streaming) are actually recorded (Requirements
@@ -242,13 +255,17 @@ fn main() -> eframe::Result {
     let stream_manager_handle = StreamManagerHandle::new();
     let shutdown_handle = stream_manager_handle.clone();
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Simple RTSP Viewer")
+        .with_inner_size([1280.0, 760.0])
+        .with_min_inner_size([560.0, 360.0])
+        // Transparent window so the Windows 11 Mica backdrop shows through.
+        .with_transparent(theme::mica_requested());
+    if let Some(icon) = app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Simple RTSP Viewer")
-            .with_inner_size([1280.0, 760.0])
-            .with_min_inner_size([560.0, 360.0])
-            // Transparent window so the Windows 11 Mica backdrop shows through.
-            .with_transparent(theme::mica_requested()),
+        viewport,
         ..Default::default()
     };
 

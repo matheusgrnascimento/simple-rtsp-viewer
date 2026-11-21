@@ -33,6 +33,10 @@ keyring = { version = "3", default-features = false, features = ["windows-native
 # Reads the Windows accent color from the registry.
 winreg = "0.56"
 
+[target.'cfg(windows)'.build-dependencies]
+# Embeds the app icon in the executable (build.rs).
+winresource = "0.1"
+
 [dev-dependencies]
 proptest = "1"
 
