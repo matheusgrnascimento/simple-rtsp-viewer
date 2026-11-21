@@ -48,6 +48,18 @@ With `FFMPEG_DIR`, `LIBCLANG_PATH` (the `bin` folder of an LLVM 19 install, cont
 cargo build --release
 ```
 
+## Installer
+
+`installer\build-installer.ps1` builds an MSI installer in `dist\` with the executable (C runtime linked statically, so no Visual C++ Redistributable is needed), the FFmpeg DLLs it uses and the license files. The MSI installs to `Program Files\Simple RTSP Viewer`, adds a Start menu shortcut and can be removed from Windows Settings > Apps. It needs [WiX Toolset 5](https://wixtoolset.org) with the UI extension:
+
+```powershell
+dotnet tool install --global wix --version 5.0.2
+wix extension add -g WixToolset.UI.wixext/5.0.2
+powershell -ExecutionPolicy Bypass -File .\installer\build-installer.ps1
+```
+
+The bundled FFmpeg build is licensed under the GPL v3; its license is installed in the `licenses` folder.
+
 ## Cameras
 
 Cameras are managed from the app's command bar:
