@@ -13,6 +13,8 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of Simple RTSP Viewer is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
+    <Icon Id="AppIcon.ico" SourceFile="$(StageDir)\icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/matheusgrnascimento/simple-rtsp-viewer" />
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
     <WixVariable Id="WixUILicenseRtf" Value="$(StageDir)\license.rtf" />
@@ -30,6 +32,7 @@
                     Description="View multiple RTSP cameras in a grid"
                     Directory="ProgramMenuFolder"
                     WorkingDirectory="INSTALLFOLDER"
+                    Icon="AppIcon.ico"
                     Advertise="yes" />
         </File>
       </Component>

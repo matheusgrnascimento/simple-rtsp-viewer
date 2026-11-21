@@ -46,6 +46,7 @@ foreach ($lib in "avcodec", "avformat", "avutil", "swresample", "swscale") {
     if (-not $dll) { throw "$lib-*.dll not found in $FfmpegDir\bin." }
     Copy-Item $dll.FullName $stage
 }
+Copy-Item "assets\icon.ico" $stage
 Copy-Item "LICENSE" "$stage\licenses\LICENSE.txt"
 Copy-Item (Join-Path $FfmpegDir "LICENSE.txt") "$stage\licenses\FFmpeg-LICENSE.txt"
 
