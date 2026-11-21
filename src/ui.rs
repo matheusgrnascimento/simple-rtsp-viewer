@@ -103,6 +103,7 @@ enum Command {
     Scan,
     Import,
     SharedLogin,
+    Refresh,
 }
 
 /// Message in the notice bar, below the command bar.
@@ -410,6 +411,20 @@ impl SimpleRtspViewerApp {
             .collect();
 
         for (key, url) in changes {
+            self.start_stream(&key, url);
+        }
+    }
+
+    /// Reconnects every camera: closes each open stream and opens it again,
+    /// which also resets the reconnection backoff. The last frame stays on
+    /// screen until the new connection delivers one.
+    fn refresh_streams(&mut self) {
+        let open: Vec<(String, String)> = self
+            .streams
+            .iter()
+            .map(|(key, stream)| (key.clone(), stream.url.clone()))
+            .collect();
+        for (key, url) in open {
             self.start_stream(&key, url);
         }
     }
@@ -1036,6 +1051,10 @@ impl SimpleRtspViewerApp {
                 )));
             }
             Command::Import => self.import_file(),
+            Command::Refresh => {
+                self.refresh_streams();
+                self.show_notice(NoticeKind::Success, "Reconnecting all cameras.");
+            }
         }
     }
 
@@ -1255,6 +1274,19 @@ impl SimpleRtspViewerApp {
                             let add = dialogs::accent_button("Add camera", &palette);
                             if ui.add(add).clicked() {
                                 command = Some(Command::AddCamera);
+                            }
+                            if total > 0
+                                && ui
+                                    .add(command_button(
+                                        theme::ICON_REFRESH,
+                                        "Refresh",
+                                        icons,
+                                        text,
+                                    ))
+                                    .on_hover_text("Reconnect every camera")
+                                    .clicked()
+                            {
+                                command = Some(Command::Refresh);
                             }
                         });
                     });
@@ -1626,6 +1658,33 @@ mod tests {
             assert!(!app.statuses.contains_key("a"));
             assert_eq!(app.enlarged, None);
             assert_eq!(app.cameras.len(), 1);
+        });
+    }
+
+    #[test]
+    fn refresh_reopens_every_stream_with_the_same_url() {
+        let cameras = vec![
+            stored("a", "/main-a", Some("/sub-a")),
+            stored("b", "/main-b", None),
+        ];
+        with_app(cameras, |app| {
+            let before: HashMap<String, watch::Receiver<ConnectionStatus>> = app
+                .streams
+                .iter()
+                .map(|(id, stream)| (id.clone(), stream.status.clone()))
+                .collect();
+
+            app.refresh_streams();
+
+            for (id, old_status) in &before {
+                let stream = &app.streams[id];
+                assert!(
+                    !stream.status.same_channel(old_status),
+                    "{id} was not reopened"
+                );
+            }
+            assert_eq!(open_url(app, "a"), "rtsp://127.0.0.1:1/sub-a");
+            assert_eq!(open_url(app, "b"), "rtsp://127.0.0.1:1/main-b");
         });
     }
 
