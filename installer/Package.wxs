@@ -1,0 +1,40 @@
+<!--
+  MSI installer for Simple RTSP Viewer (WiX Toolset 5).
+  Built by installer/build-installer.ps1, which stages the files in
+  $(StageDir) and passes the version.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="Simple RTSP Viewer"
+           Manufacturer="Matheus Nascimento"
+           Version="$(Version)"
+           UpgradeCode="6F1B3C52-7E0A-4C7D-9B1E-3A9D2F4C8E15"
+           Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Simple RTSP Viewer is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/matheusgrnascimento/simple-rtsp-viewer" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(StageDir)\license.rtf" />
+    <ui:WixUI Id="WixUI_InstallDir" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Simple RTSP Viewer" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <Feature Id="Main" Title="Simple RTSP Viewer" Level="1">
+      <Component Directory="INSTALLFOLDER">
+        <File Id="MainExe" Source="$(StageDir)\simple-rtsp-viewer.exe" KeyPath="yes">
+          <Shortcut Name="Simple RTSP Viewer"
+                    Description="View multiple RTSP cameras in a grid"
+                    Directory="ProgramMenuFolder"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Advertise="yes" />
+        </File>
+      </Component>
+      <Files Directory="INSTALLFOLDER" Include="$(StageDir)\*.dll" />
+      <Files Directory="INSTALLFOLDER" Subdirectory="licenses" Include="$(StageDir)\licenses\**" />
+    </Feature>
+  </Package>
+</Wix>
