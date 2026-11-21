@@ -10,10 +10,10 @@ Simple desktop viewer for watching multiple RTSP cameras in a grid. The project 
 - import of cameras from a JSON file;
 - simultaneous display of the streams in a responsive grid;
 - visual indicators for connected, reconnecting and failed streams;
-- automatic reconnection with progressive backoff when a stream drops;
+- automatic reconnection with progressive backoff when a stream drops, and a **Refresh** button to reconnect every camera;
 - camera reordering by drag and drop;
 - double-click to enlarge a camera (double-click or `Esc` returns to the grid);
-- substream (lower resolution) in the grid, main stream only for the enlarged camera;
+- substream (lower resolution) everywhere by default; the enlarged camera has a **Higher resolution** button to switch to the main stream;
 - frames scaled down to their on-screen size during decoding, keeping the aspect ratio;
 - GPU video decoding (D3D11VA), falling back to the CPU automatically when the GPU does not support the video;
 - Windows 11 look: light/dark theme following the system, Windows accent color, Segoe fonts and Mica backdrop;
@@ -68,6 +68,7 @@ Cameras are managed from the app's command bar:
 - **Scan network**: probes the RTSP port (554 by default) on every address of the local network, limited to 254 addresses per interface, and opens the video paths (`/stream1` and `/stream2` by default) with the default login. Cameras that respond are listed with their IP and resolution, and you choose which ones to add.
 - **Add camera**: address, port, main stream and substream paths, and the login (the default one, one for this camera only, or none). The "Test connection" button checks it before saving.
 - **Import**: merges the cameras from a JSON file (format below) into the list.
+- **Refresh**: reconnects every camera, without waiting for the reconnection backoff.
 - Right-click a camera to enlarge, edit or remove it.
 
 The list is stored in `%APPDATA%\Simple RTSP Viewer\cameras.json`, without any password, already in grid order.
@@ -90,7 +91,7 @@ The import file is a JSON file with a list of cameras. The `url` field is requir
 ]
 ```
 
-`substream_url` points to the camera's secondary stream, which has a lower resolution (on TP-Link Tapo cameras, for example, `stream1` is the main stream and `stream2` the secondary one). The grid uses it, which cuts CPU and network usage considerably; the main stream is only opened when the camera is enlarged. Without `substream_url`, the camera always uses `url`. An invalid `substream_url` is ignored without dropping the camera.
+`substream_url` points to the camera's secondary stream, which has a lower resolution (on TP-Link Tapo cameras, for example, `stream1` is the main stream and `stream2` the secondary one). The app shows it by default, also when a camera is enlarged, which cuts CPU and network usage considerably; the main stream is only opened with the **Higher resolution** button of the enlarged camera. Without `substream_url`, the camera always uses `url`. An invalid `substream_url` is ignored without dropping the camera.
 
 On import, the login embedded in the URLs goes to the Credential Manager: the first login found becomes the default login (if there is none yet), and cameras with a different login get their own login. Cameras already in the list are skipped.
 
