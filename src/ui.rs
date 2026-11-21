@@ -72,8 +72,8 @@ fn display_size_for(size_points: egui::Vec2, pixels_per_point: f32) -> DisplaySi
 /// Stream currently open for a camera and the UI's ends of the matching
 /// `StreamTask` channels.
 struct ActiveStream {
-    /// Open URL: the substream in the grid or the main one with the camera
-    /// enlarged.
+    /// Open URL: the substream, or the main one when the enlarged camera is in
+    /// high resolution.
     url: String,
     frames: mpsc::Receiver<CameraFrame>,
     status: watch::Receiver<ConnectionStatus>,
@@ -258,6 +258,9 @@ pub struct SimpleRtspViewerApp {
     /// When the current camera was enlarged, to show the hint on how to go back
     /// for a few seconds.
     enlarged_since: Option<Instant>,
+    /// The enlarged camera shows its main stream (higher resolution) instead of
+    /// the substream. Turned off whenever the enlarged camera changes.
+    high_resolution: bool,
     /// Handle to the `Stream_Manager`, used to open and close streams.
     stream_manager_handle: StreamManagerHandle,
     /// Camera library (stored list and logins), source of `cameras`.
@@ -320,6 +323,7 @@ impl SimpleRtspViewerApp {
             drag_state: None,
             enlarged: None,
             enlarged_since: None,
+            high_resolution: false,
             stream_manager_handle,
             library,
             dialog: None,
@@ -396,15 +400,17 @@ impl SimpleRtspViewerApp {
     }
 
     /// Makes sure each camera has the right stream open for the current mode:
-    /// the main one for the enlarged camera (or one without a substream), the
-    /// substream for the others. Only switches what changed.
+    /// the main one for the enlarged camera in high resolution (or for a camera
+    /// without a substream), the substream for the others. Only switches what
+    /// changed.
     fn sync_streams(&mut self) {
         let changes: Vec<(String, String)> = self
             .cameras
             .iter()
             .filter_map(|camera| {
                 let key = &camera.id;
-                let wanted = camera.stream_url(self.enlarged.as_ref() == Some(key));
+                let main = self.high_resolution && self.enlarged.as_ref() == Some(key);
+                let wanted = camera.stream_url(main);
                 let current = self.streams.get(key).map(|stream| stream.url.as_str());
                 (current != Some(wanted)).then(|| (key.clone(), wanted.to_string()))
             })
@@ -479,6 +485,15 @@ impl SimpleRtspViewerApp {
         if self.enlarged != key {
             self.enlarged_since = key.as_ref().map(|_| Instant::now());
             self.enlarged = key;
+            self.high_resolution = false;
+            self.sync_streams();
+        }
+    }
+
+    /// Switches the enlarged camera between its substream and its main stream.
+    fn set_high_resolution(&mut self, high: bool) {
+        if self.high_resolution != high {
+            self.high_resolution = high;
             self.sync_streams();
         }
     }
@@ -650,11 +665,36 @@ impl SimpleRtspViewerApp {
     }
 
     /// Draws the enlarged camera filling the whole panel. Double-click or Esc
-    /// returns to the grid.
+    /// returns to the grid. Cameras with a substream keep it and get a button
+    /// to switch to the main stream.
     fn enlarged_block(&mut self, ui: &mut egui::Ui, index: usize) {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
         self.paint_camera(ui, index, rect);
         self.paint_enlarged_hint(ui, rect);
+
+        if self.cameras[index].substream_url.is_some() {
+            let high = self.high_resolution;
+            let (label, tip) = if high {
+                ("Lower resolution", "Back to the substream")
+            } else {
+                ("Higher resolution", "Switch to the main stream")
+            };
+            let button = egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE))
+                .fill(theme::OVERLAY_CHIP)
+                .min_size(egui::vec2(0.0, 32.0));
+            // Added after the tile, so it sits on top and takes the clicks.
+            let clicked = ui
+                .allocate_ui_at_rect(rect.shrink(12.0), |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
+                        ui.add(button).on_hover_text(tip).clicked()
+                    })
+                    .inner
+                })
+                .inner;
+            if clicked {
+                self.set_high_resolution(!high);
+            }
+        }
 
         // With a dialog open the area is inactive and Esc belongs to the
         // dialog.
@@ -1613,26 +1653,36 @@ mod tests {
     }
 
     #[test]
-    fn enlarging_switches_only_that_camera_to_the_main_stream() {
+    fn enlarged_camera_keeps_the_substream_until_high_resolution_is_asked() {
         let cameras = vec![
             stored("a", "/main-a", Some("/sub-a")),
             stored("b", "/main-b", None),
+            stored("c", "/main-c", Some("/sub-c")),
         ];
         with_app(cameras, |app| {
             // In the grid: substream when there is one, main stream when not.
             assert_eq!(open_url(app, "a"), "rtsp://127.0.0.1:1/sub-a");
             assert_eq!(open_url(app, "b"), "rtsp://127.0.0.1:1/main-b");
 
-            // Enlarged: only camera A switches to the main stream.
+            // Enlarged: still on the substream.
             app.set_enlarged(Some("a".to_string()));
             assert_eq!(app.enlarged_index(), Some(0));
-            assert_eq!(open_url(app, "a"), "rtsp://127.0.0.1:1/main-a");
-            assert_eq!(open_url(app, "b"), "rtsp://127.0.0.1:1/main-b");
+            assert_eq!(open_url(app, "a"), "rtsp://127.0.0.1:1/sub-a");
 
-            // Back to the grid: A goes back to the substream.
+            // High resolution: only camera A switches to the main stream.
+            app.set_high_resolution(true);
+            assert_eq!(open_url(app, "a"), "rtsp://127.0.0.1:1/main-a");
+            assert_eq!(open_url(app, "c"), "rtsp://127.0.0.1:1/sub-c");
+            app.set_high_resolution(false);
+            assert_eq!(open_url(app, "a"), "rtsp://127.0.0.1:1/sub-a");
+
+            // Leaving the enlarged view turns high resolution off.
+            app.set_high_resolution(true);
             app.set_enlarged(None);
             assert_eq!(app.enlarged_index(), None);
             assert_eq!(open_url(app, "a"), "rtsp://127.0.0.1:1/sub-a");
+            app.set_enlarged(Some("c".to_string()));
+            assert_eq!(open_url(app, "c"), "rtsp://127.0.0.1:1/sub-c");
         });
     }
 

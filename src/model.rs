@@ -17,10 +17,10 @@ pub struct Camera {
 }
 
 impl Camera {
-    /// URL to open to show the camera: the main one when it is enlarged (or
-    /// when there is no substream), the substream in the grid.
-    pub fn stream_url(&self, enlarged: bool) -> &str {
-        match (&self.substream_url, enlarged) {
+    /// URL to open to show the camera: the main one when `main_stream` is
+    /// requested (or when there is no substream), the substream otherwise.
+    pub fn stream_url(&self, main_stream: bool) -> &str {
+        match (&self.substream_url, main_stream) {
             (Some(substream), false) => substream,
             _ => &self.rtsp_url,
         }
@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_url_uses_substream_in_grid_and_main_when_enlarged() {
+    fn stream_url_uses_main_only_when_requested() {
         let camera = Camera {
             id: "a".to_string(),
             rtsp_url: "rtsp://host/main".to_string(),
