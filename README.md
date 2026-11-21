@@ -112,3 +112,7 @@ $env:RTSP_VIEWER_GPU_DECODE = "0"; .\target\release\simple-rtsp-viewer.exe
 ```bash
 cargo test
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
