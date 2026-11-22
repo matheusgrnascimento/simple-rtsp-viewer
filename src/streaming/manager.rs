@@ -43,6 +43,16 @@ pub const GPU_DECODING_ENV: &str = "RTSP_VIEWER_GPU_DECODE";
 /// s at 15–20 fps) is enough headroom for that.
 const GPU_FIRST_FRAME_PACKET_LIMIT: u32 = 150;
 
+/// Resampling filter of the pixel converter. Measured on 2560x1440 frames
+/// (`scaler_benchmark` in `scale.rs`): bilinear keeps only 75% of the fine
+/// detail when halving the size, bicubic 98%, for about 1.5 ms more per frame
+/// (3.3 ms to 5.2 ms at 1440p to 1080p). It also interpolates the chroma
+/// planes smoothly, which area averaging does not. The "accurate rounding"
+/// and "full chroma interpolation" variants cost 4 to 5 times more for no
+/// visible gain, so they are not used.
+const SCALER_FLAGS: ffmpeg_next::software::scaling::Flags =
+    ffmpeg_next::software::scaling::Flags::BICUBIC;
+
 /// GPU decoding on, unless `GPU_DECODING_ENV` turns it off.
 fn gpu_decoding_enabled() -> bool {
     !matches!(
@@ -599,7 +609,7 @@ fn decode_stream(
                     ffmpeg_next::format::Pixel::RGBA,
                     config.out_width,
                     config.out_height,
-                    ffmpeg_next::software::scaling::Flags::BILINEAR,
+                    SCALER_FLAGS,
                 ) {
                     Ok(mut new_scaler) => {
                         if config.full_range {

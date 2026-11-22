@@ -127,3 +127,163 @@ mod tests {
         }
     }
 }
+
+/// Manual benchmark of the swscale filters, used to pick the one the decoder
+/// uses: cost per frame and how sharp a hard edge stays after downscaling.
+/// Run with:
+/// `cargo test --release scaler_benchmark -- --ignored --nocapture`
+#[cfg(test)]
+mod scaler_benchmark {
+    use std::time::Instant;
+
+    use ffmpeg_next::format::Pixel;
+    use ffmpeg_next::software::scaling::{Context, Flags};
+    use ffmpeg_next::util::frame::video::Video;
+
+    /// YUV420P frame with a hard vertical edge (black to white) at 1/3 of the
+    /// width, like the border of a bright object.
+    fn edge_frame(width: u32, height: u32) -> Video {
+        let mut frame = Video::new(Pixel::YUV420P, width, height);
+        let stride = frame.stride(0);
+        let data = frame.data_mut(0);
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                data[y * stride + x] = if x < width as usize / 3 { 16 } else { 235 };
+            }
+        }
+        for plane in 1..3 {
+            let stride = frame.stride(plane);
+            let data = frame.data_mut(plane);
+            for y in 0..height as usize / 2 {
+                data[y * stride..y * stride + width as usize / 2].fill(128);
+            }
+        }
+        frame
+    }
+
+    /// YUV420P frame of vertical stripes `period` pixels wide (half black,
+    /// half white): fine detail, like small text or a fence.
+    fn stripe_frame(width: u32, height: u32, period: usize) -> Video {
+        let mut frame = Video::new(Pixel::YUV420P, width, height);
+        let stride = frame.stride(0);
+        let data = frame.data_mut(0);
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                data[y * stride + x] = if x % period < period / 2 { 235 } else { 16 };
+            }
+        }
+        for plane in 1..3 {
+            let stride = frame.stride(plane);
+            let data = frame.data_mut(plane);
+            for y in 0..height as usize / 2 {
+                data[y * stride..y * stride + width as usize / 2].fill(128);
+            }
+        }
+        frame
+    }
+
+    /// Contrast kept on the middle row (0 to 1): the spread between the 5th
+    /// and 95th percentile of the red channel. Higher means sharper detail.
+    fn kept_contrast(rgba: &Video) -> f32 {
+        let stride = rgba.stride(0);
+        let row = &rgba.data(0)[(rgba.height() as usize / 2) * stride..];
+        let mut red: Vec<u8> = (0..rgba.width() as usize).map(|x| row[x * 4]).collect();
+        red.sort_unstable();
+        let low = red[red.len() / 20];
+        let high = red[red.len() - 1 - red.len() / 20];
+        f32::from(high - low) / 255.0
+    }
+
+    /// (width of the black-to-white transition in output pixels, overshoot in
+    /// percent of the edge height) measured on the middle row.
+    fn edge_quality(rgba: &Video) -> (usize, f32) {
+        let stride = rgba.stride(0);
+        let row = &rgba.data(0)[(rgba.height() as usize / 2) * stride..];
+        let red: Vec<f32> = (0..rgba.width() as usize)
+            .map(|x| f32::from(row[x * 4]))
+            .collect();
+        let (low, high) = (red[2], red[red.len() - 3]);
+        let span = high - low;
+        let transition = red
+            .iter()
+            .filter(|value| **value > low + 0.1 * span && **value < high - 0.1 * span)
+            .count();
+        let overshoot = red.iter().fold(0.0_f32, |worst, value| {
+            worst.max((value - high).max(low - value))
+        });
+        (transition, overshoot / span * 100.0)
+    }
+
+    #[test]
+    #[ignore = "manual benchmark"]
+    fn scaler_benchmark() {
+        let scenarios = [
+            (
+                "2560x1440 -> 1920x1080 (enlarged main stream)",
+                2560,
+                1440,
+                1920,
+                1080,
+            ),
+            ("2560x1440 -> 1280x720", 2560, 1440, 1280, 720),
+            (
+                "640x360 -> 600x336 (grid tile from the substream)",
+                640,
+                360,
+                600,
+                336,
+            ),
+        ];
+        let filters: [(&str, Flags); 6] = [
+            ("BILINEAR (current)", Flags::BILINEAR),
+            ("BICUBIC", Flags::BICUBIC),
+            ("AREA", Flags::AREA),
+            ("LANCZOS", Flags::LANCZOS),
+            (
+                "BICUBIC+ACCURATE_RND+FULL_CHR_H_INT",
+                Flags::BICUBIC | Flags::ACCURATE_RND | Flags::FULL_CHR_H_INT,
+            ),
+            (
+                "LANCZOS+ACCURATE_RND+FULL_CHR_H_INT",
+                Flags::LANCZOS | Flags::ACCURATE_RND | Flags::FULL_CHR_H_INT,
+            ),
+        ];
+
+        for (title, src_w, src_h, out_w, out_h) in scenarios {
+            let source = edge_frame(src_w, src_h);
+            let stripes = stripe_frame(src_w, src_h, 6);
+            println!("\n{title}");
+            println!(
+                "  {:<40} {:>9} {:>9} {:>14}",
+                "filter", "ms/frame", "overshoot", "fine detail"
+            );
+            for (name, flags) in &filters {
+                let mut scaler = Context::get(
+                    Pixel::YUV420P,
+                    src_w,
+                    src_h,
+                    Pixel::RGBA,
+                    out_w,
+                    out_h,
+                    *flags,
+                )
+                .expect("scaler");
+                let mut out = Video::empty();
+                for _ in 0..5 {
+                    scaler.run(&source, &mut out).expect("warm-up");
+                }
+                let runs = 40;
+                let started = Instant::now();
+                for _ in 0..runs {
+                    scaler.run(&source, &mut out).expect("run");
+                }
+                let millis = started.elapsed().as_secs_f64() * 1000.0 / f64::from(runs);
+                let (_, overshoot) = edge_quality(&out);
+                let mut detail_out = Video::empty();
+                scaler.run(&stripes, &mut detail_out).expect("stripes");
+                let detail = kept_contrast(&detail_out) * 100.0;
+                println!("  {name:<40} {millis:>9.2} {overshoot:>8.1}% {detail:>13.0}%");
+            }
+        }
+    }
+}
