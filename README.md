@@ -14,6 +14,7 @@ Simple desktop viewer for watching multiple RTSP cameras in a grid. The project 
 - camera reordering by drag and drop;
 - double-click to enlarge a camera (double-click or `Esc` returns to the grid);
 - substream (lower resolution) everywhere by default; the enlarged camera has a **Higher resolution** button to switch to the main stream;
+- camera sound: the grid is silent, and enlarging a camera plays its audio through the default Windows output device, with mute and volume controls (see [Sound](#sound));
 - frames scaled down to their on-screen size during decoding, keeping the aspect ratio;
 - GPU video decoding (D3D11VA), falling back to the CPU automatically when the GPU does not support the video;
 - Windows 11 look: light/dark theme following the system, Windows accent color, Segoe fonts and Mica backdrop;
@@ -96,6 +97,17 @@ The import file is a JSON file with a list of cameras. The `url` field is requir
 On import, the login embedded in the URLs goes to the Credential Manager: the first login found becomes the default login (if there is none yet), and cameras with a different login get their own login. Cameras already in the list are skipped.
 
 On the first run, if there is a `cameras.json` in the current folder (the format of the previous version), it is imported automatically, keeping the order from `layout.json`. After that, these two files are no longer used; since the old `cameras.json` has the password in plain text, you should delete it. It is ignored by Git to avoid accidentally committing real addresses and credentials.
+
+## Sound
+
+The grid never plays sound: the audio packets of every stream are read together with the video but dropped without being decoded, so the cameras in the grid cost nothing for audio. When you enlarge a camera, the app starts decoding the audio of the stream it already has open (the substream or the main one, there is no reconnection), converts it to stereo at the sample rate of the default output device and plays it. Going back to the grid, or enlarging another camera, moves or stops the sound; the output device is paused while no camera is enlarged.
+
+The enlarged camera shows, in its bottom-left corner (only if the stream has audio):
+
+- a **mute button**, which also stops decoding the audio while muted;
+- a **volume slider**. Half way plays the camera audio at its original level and full volume boosts it by 12 dB, because camera microphones are usually quiet. The mute and volume choices are kept while the app is open, across cameras.
+
+Any audio codec the linked FFmpeg can decode is accepted. G.711 A-law (8 kHz, mono, what TP-Link Tapo cameras send) is the one tested, with real camera data; others, such as AAC, go through the same path but were not tested. If the sound output cannot be opened (no output device, for example), the app shows an error once and the cameras stay silent.
 
 ## Running
 
