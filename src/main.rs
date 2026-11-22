@@ -2,6 +2,9 @@
 // window next to the app. Debug builds keep the console for the logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[macro_use]
+mod probe;
+
 mod audio;
 mod credentials;
 mod dialogs;
@@ -10,11 +13,14 @@ mod grid;
 mod import;
 mod layout;
 mod model;
+mod pixel;
 mod rtsp_url;
+mod sidebar;
 mod store;
 mod streaming;
 mod theme;
 mod ui;
+mod widgets;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -259,7 +265,9 @@ fn main() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Simple RTSP Viewer")
         .with_inner_size([1280.0, 760.0])
-        .with_min_inner_size([560.0, 360.0])
+        // The smallest size the layout tests cover: the sidebar alone takes
+        // 296 points, and the video needs room next to it.
+        .with_min_inner_size([720.0, 480.0])
         // Transparent window so the Windows 11 Mica backdrop shows through.
         .with_transparent(theme::mica_requested());
     if let Some(icon) = app_icon() {

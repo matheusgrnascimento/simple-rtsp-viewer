@@ -20,13 +20,17 @@ use tokio::sync::{mpsc, watch};
 
 use crate::audio::{self, AudioOutput, AudioSink};
 use crate::credentials;
-use crate::dialogs::{self, CameraForm, Dialog, DialogAction, DialogEnv, LoginForm, ScanDialog};
+use crate::dialogs::{CameraForm, Dialog, DialogAction, DialogEnv, LoginForm, ScanDialog};
 use crate::grid;
 use crate::import;
 use crate::model::{Camera, CameraFrame, ConnectionStatus, DisplaySize};
+use crate::pixel::{self, border_rect, hairline_stroke, snap_pos, snap_rect};
+use crate::probe::Probe;
+use crate::sidebar::{self, AudioControls, CameraEntry, SidebarAction, SidebarInput, Viewing};
 use crate::store::{self, CameraLibrary};
 use crate::streaming::{StreamChannels, StreamManagerHandle};
 use crate::theme;
+use crate::widgets;
 
 /// How long a toast (the short confirmation popup) stays on screen, counting
 /// its fade in and fade out. Error messages are not toasts: they stay in the
@@ -70,21 +74,20 @@ const ENLARGED_HINT_FADE: Duration = Duration::from_millis(500);
 /// design.md).
 const FRAME_CHANNEL_CAPACITY: usize = 1;
 
-/// Step, in pixels, by which the display size reported to the `StreamTask`s is
-/// rounded up. Without it, dragging the window border would change the size on
-/// every frame and each camera would recreate its pixel converter all the time.
-const DISPLAY_SIZE_STEP: u32 = 32;
-
-/// Size, in physical pixels, at which a tile of `size_points` (egui points)
-/// appears on screen, rounded up to multiples of `DISPLAY_SIZE_STEP`.
+/// Size, in whole physical pixels, at which a tile of `size_points` (egui
+/// points) appears on screen, floored to even numbers.
+///
+/// It is the exact size of the tile, never larger: the decoder scales every
+/// frame to fit in it, and the frame is then drawn 1:1 (one texel per screen
+/// pixel, see `pixel::video_rect`) with no resampling on the GPU, which is what
+/// keeps the video sharp. Following every pixel of a window resize only makes
+/// each camera recreate its pixel converter, which costs well under a
+/// millisecond.
 fn display_size_for(size_points: egui::Vec2, pixels_per_point: f32) -> DisplaySize {
-    let round_up = |points: f32| {
-        let pixels = (points * pixels_per_point).ceil().max(1.0) as u32;
-        pixels.div_ceil(DISPLAY_SIZE_STEP) * DISPLAY_SIZE_STEP
-    };
+    let (width, height) = pixel::physical_size(size_points, pixels_per_point);
     DisplaySize {
-        width: round_up(size_points.x),
-        height: round_up(size_points.y),
+        width: (width & !1).max(2),
+        height: (height & !1).max(2),
     }
 }
 
@@ -151,7 +154,27 @@ enum BlockAction {
     Remove,
 }
 
-/// Action requested from the command bar.
+/// How a tile is drawn in this frame.
+#[derive(Clone, Copy)]
+struct TileState {
+    /// The pointer is over it.
+    hovered: bool,
+    /// A dragged tile would be dropped here.
+    drop_target: bool,
+    /// It is the tile being dragged: stays in place, dimmed.
+    dimmed: bool,
+}
+
+/// Rectangles of the overlays drawn on a tile (`None` when not drawn).
+#[derive(Clone, Copy)]
+struct Overlays {
+    /// Connection status pill, centered.
+    status: Option<egui::Rect>,
+    /// Camera name label, bottom-left.
+    name: Option<egui::Rect>,
+}
+
+/// Action requested from the sidebar.
 enum Command {
     AddCamera,
     Scan,
@@ -183,17 +206,6 @@ enum NoticeKind {
     Error,
 }
 
-/// State of a drag-and-drop operation in progress on the `Viewing_Grid`
-/// (Requirements 4.1, 4.2, 4.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DragState {
-    /// Index of the `Camera_Tile` being dragged.
-    from: usize,
-    /// Index of the `Camera_Tile` currently under the cursor (candidate target), if
-    /// any.
-    hover_to: Option<usize>,
-}
-
 /// Applies a drag-and-drop position swap and tells whether the result actually
 /// differs from the original list, and therefore whether the layout persistence
 /// should be triggered. Pure function (no I/O), used both by the real UI and by
@@ -204,31 +216,14 @@ fn reorder_and_should_persist(cameras: &[Camera], from: usize, to: usize) -> (Ve
     (reordered, changed)
 }
 
-/// Largest rectangle with the aspect ratio of `content_size` that fits in
-/// `container`, centered in it. Used to draw the video without distorting the
-/// image: one dimension fills the whole tile and the other leaves equal space
-/// on both sides. Non-positive sizes (no valid frame or empty tile) return
-/// `container` itself, avoiding a division by zero.
-fn fit_preserving_aspect(container: egui::Rect, content_size: egui::Vec2) -> egui::Rect {
-    if content_size.x <= 0.0
-        || content_size.y <= 0.0
-        || container.width() <= 0.0
-        || container.height() <= 0.0
-    {
-        return container;
-    }
-
-    let scale = (container.width() / content_size.x).min(container.height() / content_size.y);
-    egui::Rect::from_center_size(container.center(), content_size * scale)
-}
-
 /// Windows dark theme; without information from the system, assumes dark.
 fn is_dark(system_theme: Option<eframe::Theme>) -> bool {
     system_theme.is_none_or(|theme| theme == eframe::Theme::Dark)
 }
 
 /// Pill-shaped status notice, centered in the tile: an indicator (spinner or
-/// colored dot) and the text.
+/// colored dot) and the text. Returns the pill's rectangle, or `None` when the
+/// tile is too small for it (nothing is drawn then, rather than overflowing).
 fn paint_status_pill(
     ui: &egui::Ui,
     painter: &egui::Painter,
@@ -236,23 +231,39 @@ fn paint_status_pill(
     label: &str,
     color: Option<egui::Color32>,
     spinner: bool,
-) {
+) -> Option<egui::Rect> {
     const MARKER: f32 = 14.0;
-    let label = painter.layout_no_wrap(
-        label.to_owned(),
+    let ppp = ui.ctx().pixels_per_point();
+    let marker_space = if spinner || color.is_some() {
+        MARKER + 8.0
+    } else {
+        0.0
+    };
+
+    // The pill must fit in the tile, with a margin; the label shrinks (with an
+    // ellipsis) before the pill outgrows it.
+    let max_label = tile.width() - 16.0 - 28.0 - marker_space;
+    if max_label < 24.0 || tile.height() < 48.0 {
+        return None;
+    }
+    let label = widgets::single_line(
+        ui,
+        label,
         egui::FontId::proportional(13.0),
         egui::Color32::WHITE,
+        max_label,
     );
-    let has_marker = spinner || color.is_some();
-    let marker_space = if has_marker { MARKER + 8.0 } else { 0.0 };
-    let pill = egui::Rect::from_center_size(
-        tile.center(),
-        egui::vec2(marker_space + label.size().x + 28.0, 30.0),
+    let pill = snap_rect(
+        egui::Rect::from_center_size(
+            tile.center(),
+            egui::vec2(marker_space + label.size().x + 28.0, 32.0),
+        ),
+        ppp,
     );
-    painter.rect_filled(pill, 15.0, theme::OVERLAY_CHIP);
+    painter.rect_filled(pill, 16.0, theme::OVERLAY_CHIP);
 
     let mut x = pill.left() + 14.0;
-    if has_marker {
+    if marker_space > 0.0 {
         let marker = egui::Rect::from_center_size(
             egui::pos2(x + MARKER / 2.0, pill.center().y),
             egui::vec2(MARKER, MARKER),
@@ -263,40 +274,64 @@ fn paint_status_pill(
                 .color(color.unwrap_or(egui::Color32::WHITE))
                 .paint_at(ui, marker);
         } else if let Some(color) = color {
-            painter.circle_filled(marker.center(), 4.0, color);
+            painter.circle_filled(snap_pos(marker.center(), ppp), 4.0, color);
         }
         x += marker_space;
     }
-    let y = pill.center().y - label.size().y / 2.0;
-    painter.galley(egui::pos2(x, y), label, egui::Color32::WHITE);
+    widgets::paint_text_left(ui, label, x, pill.center().y, egui::Color32::WHITE);
+    Some(pill)
 }
 
 /// Label with the camera name in the bottom-left corner of the tile, with a
-/// green dot when the video is live. Omitted on tiles too narrow for it.
-fn paint_name_chip(painter: &egui::Painter, tile: egui::Rect, name: &str, live: bool) {
-    let label = painter.layout_no_wrap(
-        name.to_owned(),
+/// green dot when the video is live. The name is cut with an ellipsis to fit
+/// the tile; the label is omitted when even a short name would not fit, or
+/// when it would touch `avoid` (the status pill, which takes priority).
+/// Returns the label's rectangle when drawn.
+fn paint_name_chip(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    tile: egui::Rect,
+    name: &str,
+    live: bool,
+    avoid: Option<egui::Rect>,
+) -> Option<egui::Rect> {
+    let ppp = ui.ctx().pixels_per_point();
+    let dot_space = if live { 14.0 } else { 0.0 };
+    let max_label = tile.width() - 16.0 - 16.0 - dot_space;
+    if max_label < 24.0 || tile.height() < 56.0 {
+        return None;
+    }
+    let label = widgets::single_line(
+        ui,
+        name,
         egui::FontId::proportional(13.0),
         egui::Color32::WHITE,
+        max_label,
     );
-    let dot_space = if live { 14.0 } else { 0.0 };
-    let size = egui::vec2(dot_space + label.size().x + 16.0, label.size().y + 8.0);
-    if size.x > tile.width() - 16.0 || size.y > tile.height() - 16.0 {
-        return;
+    let size = egui::vec2(dot_space + label.size().x + 16.0, 24.0);
+    let chip = snap_rect(
+        egui::Rect::from_min_size(
+            egui::pos2(tile.left() + 8.0, tile.bottom() - 8.0 - size.y),
+            size,
+        ),
+        ppp,
+    );
+    if avoid.is_some_and(|other| other.expand(4.0).intersects(chip)) {
+        return None;
     }
-    let chip = egui::Rect::from_min_size(
-        egui::pos2(tile.left() + 8.0, tile.bottom() - 8.0 - size.y),
-        size,
-    );
     painter.rect_filled(chip, 4.0, theme::OVERLAY_CHIP);
 
     let mut x = chip.left() + 8.0;
     if live {
-        painter.circle_filled(egui::pos2(x + 3.0, chip.center().y), 3.0, theme::SUCCESS);
+        painter.circle_filled(
+            snap_pos(egui::pos2(x + 3.0, chip.center().y), ppp),
+            3.0,
+            theme::SUCCESS,
+        );
         x += dot_space;
     }
-    let y = chip.center().y - label.size().y / 2.0;
-    painter.galley(egui::pos2(x, y), label, egui::Color32::WHITE);
+    widgets::paint_text_left(ui, label, x, chip.center().y, egui::Color32::WHITE);
+    Some(chip)
 }
 
 /// `SimpleRtspViewerApp`: integration of the `Viewing_Grid` with
@@ -313,9 +348,17 @@ pub struct SimpleRtspViewerApp {
     textures: HashMap<String, egui::TextureHandle>,
     /// Last `ConnectionStatus` read for each camera, keyed by `id`.
     statuses: HashMap<String, ConnectionStatus>,
-    /// State of the drag-and-drop operation in progress, if any.
-    drag_state: Option<DragState>,
-    /// Enlarged camera (filling the whole window), by `id`; `None` shows the
+    /// Index of the tile being dragged (drag and drop), if any, to draw the
+    /// preview that follows the pointer and dim the tile it came from.
+    dragging: Option<usize>,
+    /// The sidebar shows only icons.
+    sidebar_collapsed: bool,
+    /// Area of the window the video fills (everything right of the sidebar),
+    /// from the last frame; the toast is placed in it.
+    content_rect: egui::Rect,
+    /// Where each component was drawn, recorded for the layout tests.
+    probe: Probe,
+    /// Enlarged camera (filling the content area), by `id`; `None` shows the
     /// grid.
     enlarged: Option<String>,
     /// When the current camera was enlarged, to show the hint on how to go back
@@ -387,7 +430,10 @@ impl SimpleRtspViewerApp {
             streams: HashMap::new(),
             textures: HashMap::new(),
             statuses: HashMap::new(),
-            drag_state: None,
+            dragging: None,
+            sidebar_collapsed: false,
+            content_rect: egui::Rect::NOTHING,
+            probe: Probe::default(),
             enlarged: None,
             enlarged_since: None,
             high_resolution: false,
@@ -723,81 +769,169 @@ impl SimpleRtspViewerApp {
         }
     }
 
-    /// Draws the `Viewing_Grid`: a "no cameras loaded" message when the list is
-    /// empty (Requirement 2.3), or the grid of `Camera_Tile`s sized by
-    /// `grid::grid_dimensions` (Requirements 2.1, 2.2), handling drag-and-drop
-    /// (Requirements 4.1, 4.2, 4.3) and applying the reorder + persistence when
-    /// a valid drop happens.
-    fn draw_grid(&mut self, ctx: &egui::Context) {
-        // A drag-and-drop operation only exists while a pointer button is held
-        // down; when the button is released (or cancelled), egui already clears
-        // its own dnd payload, so here we clear the auxiliary visual state kept
-        // in `drag_state`.
-        if !ctx.input(|i| i.pointer.any_down()) {
-            self.drag_state = None;
-        }
+    // -----------------------------------------------------------------------
+    // Sidebar
+    // -----------------------------------------------------------------------
 
+    /// Draws the sidebar and applies what the user did in it.
+    fn draw_sidebar(&mut self, ctx: &egui::Context) {
+        let actions = {
+            let entries: Vec<CameraEntry<'_>> = self
+                .cameras
+                .iter()
+                .zip(&self.library.data.cameras)
+                .map(|(camera, stored)| {
+                    debug_assert_eq!(camera.id, stored.id);
+                    CameraEntry {
+                        id: &camera.id,
+                        name: camera.name.as_deref().unwrap_or(&stored.host),
+                        address: stored.address(),
+                        status: self
+                            .statuses
+                            .get(&camera.id)
+                            .copied()
+                            .unwrap_or(ConnectionStatus::Disconnected),
+                    }
+                })
+                .collect();
+            let input = SidebarInput {
+                palette: &self.look.palette,
+                icons: self.look.icons,
+                mica: self.look.mica,
+                collapsed: self.sidebar_collapsed,
+                enabled: self.dialog.is_none(),
+                cameras: &entries,
+                enlarged: self.enlarged.as_deref(),
+                viewing: self.viewing(),
+            };
+            sidebar::show(ctx, &input, &self.probe)
+        };
+
+        for action in actions {
+            self.apply_sidebar_action(action);
+        }
+    }
+
+    /// What the sidebar shows about the enlarged camera, if any.
+    fn viewing(&self) -> Option<Viewing<'_>> {
+        let index = self.enlarged_index()?;
+        let camera = &self.cameras[index];
+        let stored = self.library.data.cameras.get(index)?;
+        let has_substream = camera.substream_url.is_some();
+        let main_open = !has_substream || self.high_resolution;
+        let has_audio = !self.audio.open_failed
+            && self
+                .streams
+                .get(&camera.id)
+                .is_some_and(|stream| *stream.has_audio.borrow());
+
+        Some(Viewing {
+            name: camera.name.as_deref().unwrap_or(&stored.host),
+            detail: format!(
+                "{} · {}",
+                stored.address(),
+                if main_open {
+                    "Main stream"
+                } else {
+                    "Substream"
+                }
+            ),
+            high_resolution: has_substream.then_some(self.high_resolution),
+            audio: has_audio.then_some(AudioControls {
+                muted: self.audio.muted,
+                volume: self.audio.volume,
+                default_volume: audio::DEFAULT_VOLUME,
+            }),
+        })
+    }
+
+    fn apply_sidebar_action(&mut self, action: SidebarAction) {
+        match action {
+            SidebarAction::AddCamera => self.run_command(Command::AddCamera),
+            SidebarAction::Scan => self.run_command(Command::Scan),
+            SidebarAction::Import => self.run_command(Command::Import),
+            SidebarAction::Refresh => self.run_command(Command::Refresh),
+            SidebarAction::SharedLogin => self.run_command(Command::SharedLogin),
+            SidebarAction::ToggleCollapsed => self.sidebar_collapsed = !self.sidebar_collapsed,
+            SidebarAction::Select(id) => {
+                // Selecting the camera that is already enlarged goes back to
+                // the grid.
+                if self.enlarged.as_deref() == Some(id.as_str()) {
+                    self.set_enlarged(None);
+                } else {
+                    self.set_enlarged(Some(id));
+                }
+            }
+            SidebarAction::Edit(id) => self.open_edit_dialog(&id),
+            SidebarAction::Remove(id) => {
+                let label = self.camera_label(&id);
+                self.dialog = Some(Dialog::ConfirmRemove { id, label });
+            }
+            SidebarAction::BackToGrid => self.set_enlarged(None),
+            SidebarAction::SetHighResolution(high) => self.set_high_resolution(high),
+            SidebarAction::SetMuted(muted) => self.set_muted(muted),
+            SidebarAction::SetVolume(volume) => self.set_volume(volume),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Content: grid or enlarged camera
+    // -----------------------------------------------------------------------
+
+    /// Draws everything right of the sidebar: the empty screen, the enlarged
+    /// camera or the grid of `Camera_Tile`s (Requirements 2.1, 2.2, 2.3).
+    fn draw_content(&mut self, ctx: &egui::Context) {
         // With Mica, the panel is transparent so the effect shows around and
         // between the tiles.
-        let panel_fill = if self.look.mica {
-            egui::Color32::TRANSPARENT
-        } else {
-            self.look.palette.window_background
-        };
         let panel = egui::Frame::none()
-            .fill(panel_fill)
+            .fill(self.panel_fill())
             .inner_margin(egui::Margin::same(GAP));
 
-        // With a dialog open, the grid is inactive (as in a modal window).
+        // With a dialog open, the content is inactive (as in a modal window).
         let interactive = self.dialog.is_none();
         egui::CentralPanel::default().frame(panel).show(ctx, |ui| {
-            ui.add_enabled_ui(interactive, |ui| self.grid_contents(ui));
+            ui.add_enabled_ui(interactive, |ui| self.content(ui));
         });
     }
 
-    /// Content of the central panel: empty screen, enlarged camera or the grid.
-    fn grid_contents(&mut self, ui: &mut egui::Ui) {
+    fn content(&mut self, ui: &mut egui::Ui) {
+        let ppp = ui.ctx().pixels_per_point();
+        let area = ui.available_rect_before_wrap();
+        self.content_rect = area;
+        probe!(self.probe, "container:content", area);
+
         if self.cameras.is_empty() {
-            self.paint_empty_state(ui);
+            self.paint_empty_state(ui, area);
             return;
         }
 
         if let Some(index) = self.enlarged_index() {
-            self.enlarged_block(ui, index);
+            self.enlarged_tile(ui, index, snap_rect(area, ppp));
             return;
         }
 
-        let (columns, rows) = grid::grid_dimensions(self.cameras.len());
-        let available = ui.available_size();
-        // The gaps between the tiles come out of the available size, so the
-        // grid fits the panel exactly.
-        let cell_size = egui::vec2(
-            ((available.x - GAP * (columns - 1) as f32) / columns as f32).max(1.0),
-            ((available.y - GAP * (rows - 1) as f32) / rows as f32).max(1.0),
-        );
+        self.grid_tiles(ui, area, ppp);
+    }
+
+    /// The grid: every tile laid out by `grid::tile_rects` (equal size, edges
+    /// on whole pixels, never overlapping), with drag-and-drop reordering
+    /// (Requirements 4.1, 4.2, 4.3).
+    fn grid_tiles(&mut self, ui: &mut egui::Ui, area: egui::Rect, ppp: f32) {
+        let rects = grid::tile_rects(self.cameras.len(), area, GAP, ppp);
 
         let mut action: Option<(usize, BlockAction)> = None;
-
-        egui::Grid::new("camera_grid")
-            .min_col_width(cell_size.x)
-            .min_row_height(cell_size.y)
-            .spacing(egui::vec2(GAP, GAP))
-            .show(ui, |ui| {
-                for row in 0..rows {
-                    for col in 0..columns {
-                        let index = row * columns + col;
-                        if index >= self.cameras.len() {
-                            ui.label("");
-                            continue;
-                        }
-                        let block_action = self.camera_block(ui, index, cell_size);
-                        if !matches!(block_action, BlockAction::None) {
-                            action = Some((index, block_action));
-                        }
-                    }
-                    ui.end_row();
-                }
-            });
+        let mut dragging = None;
+        for (index, rect) in rects.iter().copied().enumerate() {
+            let (block_action, is_dragged) = self.camera_tile(ui, index, rect);
+            if is_dragged {
+                dragging = Some(index);
+            }
+            if !matches!(block_action, BlockAction::None) {
+                action = Some((index, block_action));
+            }
+        }
+        self.dragging = dragging;
+        self.paint_drag_preview(ui);
 
         let Some((index, action)) = action else {
             return;
@@ -815,254 +949,52 @@ impl SimpleRtspViewerApp {
         }
     }
 
-    /// Draws the enlarged camera filling the whole panel. Double-click or Esc
-    /// returns to the grid. Cameras with a substream keep it and get a button
-    /// to switch to the main stream.
-    fn enlarged_block(&mut self, ui: &mut egui::Ui, index: usize) {
-        let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
-        self.paint_camera(ui, index, rect);
-        self.paint_enlarged_hint(ui, rect);
+    /// One grid tile, as both a drag-and-drop source and target (Requirements
+    /// 2.1, 4.1, 4.2, 4.3). Returns what the user did on it and whether it is
+    /// being dragged.
+    fn camera_tile(
+        &mut self,
+        ui: &mut egui::Ui,
+        index: usize,
+        rect: egui::Rect,
+    ) -> (BlockAction, bool) {
+        let id = ui
+            .id()
+            .with(("camera_tile", self.cameras[index].id.as_str()));
+        let response = ui.interact(rect, id, egui::Sense::click_and_drag());
+        // Stores the payload the moment the drag starts.
+        response.dnd_set_drag_payload(index);
 
-        if self.cameras[index].substream_url.is_some() {
-            let high = self.high_resolution;
-            let (label, tip) = if high {
-                ("Lower resolution", "Back to the substream")
-            } else {
-                ("Higher resolution", "Switch to the main stream")
-            };
-            let button = egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE))
-                .fill(theme::OVERLAY_CHIP)
-                .min_size(egui::vec2(0.0, 32.0));
-            // Added after the tile, so it sits on top and takes the clicks.
-            let clicked = ui
-                .allocate_ui_at_rect(rect.shrink(12.0), |ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
-                        ui.add(button).on_hover_text(tip).clicked()
-                    })
-                    .inner
-                })
-                .inner;
-            if clicked {
-                self.set_high_resolution(!high);
-            }
+        let is_dragged = ui.ctx().is_being_dragged(id);
+        if is_dragged {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
 
-        self.paint_audio_controls(ui, rect, index);
-
-        // With a dialog open the area is inactive and Esc belongs to the
-        // dialog.
-        let escape = ui.is_enabled() && ui.input(|input| input.key_pressed(egui::Key::Escape));
-        if response.double_clicked() || escape {
-            self.set_enlarged(None);
-        }
-    }
-
-    /// Sound controls of the enlarged camera, in its bottom-left corner: a
-    /// mute button and the volume. Shown only when the stream has audio the app
-    /// can decode and the output device could be opened.
-    fn paint_audio_controls(&mut self, ui: &mut egui::Ui, rect: egui::Rect, index: usize) {
-        let has_audio = self
-            .streams
-            .get(&self.cameras[index].id)
-            .is_some_and(|stream| *stream.has_audio.borrow());
-        if !has_audio || self.audio.open_failed {
-            return;
-        }
-
-        let icons = self.look.icons;
-        let muted = self.audio.muted;
-        let mut volume = self.audio.volume;
-        let mut toggle_mute = false;
-        let white = egui::Color32::WHITE;
-
-        // Added after the tile, so it sits on top and takes the clicks.
-        ui.allocate_ui_at_rect(rect.shrink(12.0), |ui| {
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Max), |ui| {
-                egui::Frame::none()
-                    .fill(theme::OVERLAY_CHIP)
-                    .rounding(6.0)
-                    .inner_margin(egui::Margin::symmetric(4.0, 0.0))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let (label, tip) = match (muted, icons) {
-                                (true, true) => (
-                                    egui::RichText::new(theme::ICON_MUTE)
-                                        .font(theme::icon_font(16.0)),
-                                    "Turn the sound on",
-                                ),
-                                (false, true) => (
-                                    egui::RichText::new(theme::ICON_VOLUME)
-                                        .font(theme::icon_font(16.0)),
-                                    "Mute",
-                                ),
-                                (true, false) => {
-                                    (egui::RichText::new("Unmute"), "Turn the sound on")
-                                }
-                                (false, false) => (egui::RichText::new("Mute"), "Mute"),
-                            };
-                            let button = egui::Button::new(label.color(white))
-                                .frame(false)
-                                .min_size(egui::vec2(32.0, 32.0));
-                            if ui.add(button).on_hover_text(tip).clicked() {
-                                toggle_mute = true;
-                            }
-
-                            ui.spacing_mut().slider_width = 100.0;
-                            let slider = egui::Slider::new(&mut volume, 0.0..=1.0)
-                                .show_value(false)
-                                .trailing_fill(true);
-                            // Greyed out while muted: the button unmutes.
-                            ui.add_enabled(!muted, slider).on_hover_text(
-                                "Volume. Half way is the camera's original level; \
-                                 the right half boosts quiet microphones.",
-                            );
-                            ui.add_space(8.0);
-                        });
-                    });
-            });
-        });
-
-        if toggle_mute {
-            self.set_muted(!muted);
-        }
-        if volume != self.audio.volume {
-            self.set_volume(volume);
-        }
-    }
-
-    /// Hint on how to go back to the grid, in the top-right corner of the
-    /// enlarged camera, during the first seconds after enlarging.
-    fn paint_enlarged_hint(&self, ui: &egui::Ui, rect: egui::Rect) {
-        let Some(since) = self.enlarged_since else {
-            return;
-        };
-        let elapsed = since.elapsed();
-        if elapsed >= ENLARGED_HINT_DURATION {
-            return;
-        }
-        let remaining = ENLARGED_HINT_DURATION - elapsed;
-        let opacity = (remaining.as_secs_f32() / ENLARGED_HINT_FADE.as_secs_f32()).min(1.0);
-        let text_color = egui::Color32::WHITE.gamma_multiply(opacity);
-
-        let painter = ui.painter().with_clip_rect(rect);
-        let label = painter.layout_no_wrap(
-            "Double-click or Esc to go back to the grid".to_owned(),
-            egui::FontId::proportional(13.0),
-            text_color,
-        );
-        let icon = self.look.icons.then(|| {
-            painter.layout_no_wrap(
-                theme::ICON_BACK_TO_WINDOW.to_owned(),
-                theme::icon_font(14.0),
-                text_color,
-            )
-        });
-        let icon_space = icon.as_ref().map_or(0.0, |icon| icon.size().x + 8.0);
-
-        let size = egui::vec2(icon_space + label.size().x + 24.0, 32.0);
-        let chip = egui::Rect::from_min_size(
-            egui::pos2(rect.right() - 12.0 - size.x, rect.top() + 12.0),
-            size,
-        );
-        painter.rect_filled(chip, 6.0, theme::OVERLAY_CHIP.gamma_multiply(opacity));
-
-        let mut x = chip.left() + 12.0;
-        if let Some(icon) = icon {
-            let y = chip.center().y - icon.size().y / 2.0;
-            painter.galley(egui::pos2(x, y), icon, text_color);
-            x += icon_space;
-        }
-        let y = chip.center().y - label.size().y / 2.0;
-        painter.galley(egui::pos2(x, y), label, text_color);
-
-        // Keeps the fade-out animation running even without new frames.
-        ui.ctx().request_repaint_after(Duration::from_millis(50));
-    }
-
-    /// Screen without cameras: icon, title and how to open a camera file.
-    fn paint_empty_state(&self, ui: &egui::Ui) {
-        let palette = &self.look.palette;
-        let rect = ui.available_rect_before_wrap();
-        let painter = ui.painter();
-        let center_x = rect.center().x;
-        let mut y = rect.center().y - 48.0;
-
-        if self.look.icons {
-            painter.text(
-                egui::pos2(center_x, y),
-                egui::Align2::CENTER_CENTER,
-                theme::ICON_VIDEO,
-                theme::icon_font(40.0),
-                palette.text_secondary,
-            );
-            y += 48.0;
-        }
-        painter.text(
-            egui::pos2(center_x, y),
-            egui::Align2::CENTER_CENTER,
-            "No cameras yet",
-            theme::semibold(20.0),
-            palette.text,
-        );
-        y += 32.0;
-        painter.text(
-            egui::pos2(center_x, y),
-            egui::Align2::CENTER_CENTER,
-            "Use \"Scan network\" to find your cameras,",
-            egui::FontId::proportional(14.0),
-            palette.text_secondary,
-        );
-        y += 22.0;
-        painter.text(
-            egui::pos2(center_x, y),
-            egui::Align2::CENTER_CENTER,
-            "or \"Add camera\" to enter the address of one.",
-            egui::FontId::proportional(14.0),
-            palette.text_secondary,
-        );
-    }
-
-    /// Draws camera `index` in `rect` and tells its `StreamTask` the size at
-    /// which it is shown.
-    fn paint_camera(&self, ui: &egui::Ui, index: usize, rect: egui::Rect) {
-        let camera = &self.cameras[index];
-        let key = &camera.id;
-        let status = self
-            .statuses
-            .get(key)
-            .copied()
-            .unwrap_or(ConnectionStatus::Disconnected);
-
-        self.paint_tile(
+        let drop_target = response
+            .dnd_hover_payload::<usize>()
+            .is_some_and(|from| *from != index);
+        let overlays = self.paint_camera(
             ui,
+            index,
             rect,
-            self.textures.get(key),
-            status,
-            camera.name.as_deref(),
+            TileState {
+                hovered: response.hovered(),
+                drop_target,
+                dimmed: is_dragged,
+            },
         );
-        self.report_display_size(key, rect.size(), ui.ctx().pixels_per_point());
-    }
+        probe!(self.probe, format!("tile:{index}"), rect);
+        if let Some(status) = overlays.status {
+            probe!(self.probe, format!("tile:{index}:status"), status);
+        }
+        if let Some(name) = overlays.name {
+            probe!(self.probe, format!("tile:{index}:name"), name);
+        }
 
-    /// Draws a single `Camera_Tile` (index `index`) with size `size`, treating
-    /// it as both a drag-and-drop source and target (Requirements 2.1, 4.1,
-    /// 4.2, 4.3). Reports a valid drop (target different from the source)
-    /// finished over this tile, or a double-click to enlarge it.
-    fn camera_block(&mut self, ui: &mut egui::Ui, index: usize, size: egui::Vec2) -> BlockAction {
-        let item_id = egui::Id::new("simple_rtsp_viewer_camera_block").with(index);
-
-        let response = ui
-            .dnd_drag_source(item_id, index, |ui| {
-                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-                self.paint_camera(ui, index, rect);
-            })
-            .response;
-
-        // `dnd_drag_source` only detects dragging; adding click sensing to the
-        // same widget allows double-clicking to enlarge. With both, egui tells
-        // a click from a drag by the pointer movement.
-        let response = response.interact(egui::Sense::click());
         if response.double_clicked() {
-            return BlockAction::Enlarge;
+            return (BlockAction::Enlarge, is_dragged);
         }
 
         // Context menu (right button), as on Windows items.
@@ -1084,67 +1016,267 @@ impl SimpleRtspViewerApp {
             }
         });
         if let Some(action) = menu_action {
-            return action;
+            return (action, is_dragged);
         }
 
-        // Border a little more visible when hovered, as on Windows 11 cards.
-        if response.hovered() && !response.dragged() {
-            ui.painter().rect_stroke(
-                response.rect,
-                TILE_ROUNDING,
-                egui::Stroke::new(1.0_f32, self.look.palette.tile_border_hover),
-            );
-        }
-
-        // While this tile is being dragged, keeps `drag_state.from` pointing to
-        // it, preserving the `hover_to` already detected (if it still belongs
-        // to this same drag).
-        if response.dragged() {
-            let hover_to = self
-                .drag_state
-                .filter(|state| state.from == index)
-                .and_then(|state| state.hover_to);
-            self.drag_state = Some(DragState {
-                from: index,
-                hover_to,
-            });
-        }
-
-        let mut action = BlockAction::None;
-
-        if let Some(hovered_from) = response.dnd_hover_payload::<usize>() {
-            let from = *hovered_from;
-            if from != index {
-                if let Some(state) = self.drag_state.as_mut() {
-                    if state.from == from {
-                        state.hover_to = Some(index);
-                    }
-                }
-                // Visual indication of the target position during the drag
-                // (Requirement 4.3), in the Windows accent color.
-                ui.painter().rect_stroke(
-                    response.rect,
-                    TILE_ROUNDING,
-                    egui::Stroke::new(2.0_f32, self.look.palette.accent),
+        if let Some(from) = response.dnd_release_payload::<usize>() {
+            if *from != index {
+                return (
+                    BlockAction::Drop {
+                        from: *from,
+                        to: index,
+                    },
+                    is_dragged,
                 );
             }
         }
 
-        if let Some(dragged_from) = response.dnd_release_payload::<usize>() {
-            let from = *dragged_from;
-            if from != index {
-                action = BlockAction::Drop { from, to: index };
-            }
-            self.drag_state = None;
+        (BlockAction::None, is_dragged)
+    }
+
+    /// Small preview of the tile being dragged, following the pointer.
+    fn paint_drag_preview(&self, ui: &egui::Ui) {
+        let Some(index) = self.dragging else {
+            return;
+        };
+        let Some(pointer) = ui.ctx().pointer_interact_pos() else {
+            return;
+        };
+        let camera = &self.cameras[index];
+        let palette = &self.look.palette;
+        let size = egui::vec2(176.0, 100.0);
+
+        egui::Area::new(egui::Id::new("simple_rtsp_viewer_drag_preview"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(pointer - size / 2.0)
+            .interactable(false)
+            .show(ui.ctx(), |ui| {
+                ui.set_opacity(0.92);
+                let ppp = ui.ctx().pixels_per_point();
+                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                let rect = snap_rect(rect, ppp);
+                ui.painter()
+                    .rect_filled(rect, TILE_ROUNDING, palette.tile_background);
+                if let Some(texture) = self.textures.get(&camera.id) {
+                    let video = pixel::fit_preserving_aspect(rect, texture.size_vec2());
+                    let mut shape = egui::epaint::RectShape::filled(
+                        snap_rect(video, ppp),
+                        0.0,
+                        egui::Color32::WHITE,
+                    );
+                    shape.fill_texture_id = texture.id();
+                    shape.uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    ui.painter().add(shape);
+                }
+                ui.painter().rect_stroke(
+                    border_rect(rect, ppp),
+                    TILE_ROUNDING,
+                    egui::Stroke::new(2.0 / ppp, palette.accent),
+                );
+                if let Some(name) = camera.name.as_deref() {
+                    paint_name_chip(ui, ui.painter(), rect, name, false, None);
+                }
+            });
+    }
+
+    /// The enlarged camera filling the content area. Double-click or Esc
+    /// returns to the grid; the resolution and the sound are controlled from
+    /// the sidebar, so nothing floats over the picture except the name, the
+    /// connection status and a temporary hint.
+    fn enlarged_tile(&mut self, ui: &mut egui::Ui, index: usize, rect: egui::Rect) {
+        let id = ui
+            .id()
+            .with(("enlarged_tile", self.cameras[index].id.as_str()));
+        let response = ui.interact(rect, id, egui::Sense::click());
+
+        let overlays = self.paint_camera(
+            ui,
+            index,
+            rect,
+            TileState {
+                hovered: false,
+                drop_target: false,
+                dimmed: false,
+            },
+        );
+        let hint = self.paint_enlarged_hint(ui, rect, &[overlays.status, overlays.name]);
+
+        probe!(self.probe, "tile:enlarged", rect);
+        if let Some(status) = overlays.status {
+            probe!(self.probe, "tile:enlarged:status", status);
+        }
+        if let Some(name) = overlays.name {
+            probe!(self.probe, "tile:enlarged:name", name);
+        }
+        if let Some(hint) = hint {
+            probe!(self.probe, "tile:enlarged:hint", hint);
         }
 
-        action
+        // With a dialog open the area is inactive and Esc belongs to the
+        // dialog.
+        let escape = ui.is_enabled() && ui.input(|input| input.key_pressed(egui::Key::Escape));
+        if response.double_clicked() || escape {
+            self.set_enlarged(None);
+        }
+    }
+
+    /// Hint on how to go back to the grid, in the top-right corner of the
+    /// enlarged camera, during the first seconds after enlarging. Uses the
+    /// longest wording that fits, and is skipped when it would touch another
+    /// overlay (`avoid`). Returns its rectangle while visible.
+    fn paint_enlarged_hint(
+        &self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        avoid: &[Option<egui::Rect>],
+    ) -> Option<egui::Rect> {
+        let since = self.enlarged_since?;
+        let elapsed = since.elapsed();
+        if elapsed >= ENLARGED_HINT_DURATION {
+            return None;
+        }
+        // Keeps the fade-out animation running even without new frames.
+        ui.ctx().request_repaint_after(Duration::from_millis(50));
+
+        let ppp = ui.ctx().pixels_per_point();
+        let remaining = ENLARGED_HINT_DURATION - elapsed;
+        let opacity = (remaining.as_secs_f32() / ENLARGED_HINT_FADE.as_secs_f32()).min(1.0);
+        let text_color = egui::Color32::WHITE.gamma_multiply(opacity);
+
+        let icon_space = if self.look.icons { 22.0 } else { 0.0 };
+        let painter = ui.painter().with_clip_rect(rect);
+        let wordings = [
+            "Double-click or Esc to go back to the grid",
+            "Esc to go back",
+        ];
+        let max_width = rect.width() - 24.0 - 24.0 - icon_space;
+        let label = wordings.iter().find_map(|wording| {
+            let galley = widgets::single_line(
+                ui,
+                wording,
+                egui::FontId::proportional(13.0),
+                text_color,
+                f32::INFINITY,
+            );
+            (galley.size().x <= max_width).then(|| {
+                widgets::single_line(
+                    ui,
+                    wording,
+                    egui::FontId::proportional(13.0),
+                    text_color,
+                    max_width,
+                )
+            })
+        })?;
+
+        let size = egui::vec2(icon_space + label.size().x + 24.0, 32.0);
+        let chip = snap_rect(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.right() - 12.0 - size.x, rect.top() + 12.0),
+                size,
+            ),
+            ppp,
+        );
+        if avoid
+            .iter()
+            .flatten()
+            .any(|other| other.expand(4.0).intersects(chip))
+        {
+            return None;
+        }
+        painter.rect_filled(chip, 6.0, theme::OVERLAY_CHIP.gamma_multiply(opacity));
+
+        let mut x = chip.left() + 12.0;
+        if self.look.icons {
+            widgets::paint_icon(
+                ui,
+                theme::ICON_BACK_TO_WINDOW,
+                14.0,
+                egui::pos2(x + 7.0, chip.center().y),
+                text_color,
+            );
+            x += icon_space;
+        }
+        widgets::paint_text_left(ui, label, x, chip.center().y, text_color);
+        Some(chip)
+    }
+
+    /// Screen without cameras: icon, title and where to add them.
+    fn paint_empty_state(&self, ui: &egui::Ui, area: egui::Rect) {
+        let palette = &self.look.palette;
+        let painter = ui.painter();
+        let center_x = area.center().x;
+        let mut y = area.center().y - 48.0;
+
+        if self.look.icons {
+            painter.text(
+                snap_pos(egui::pos2(center_x, y), ui.ctx().pixels_per_point()),
+                egui::Align2::CENTER_CENTER,
+                theme::ICON_VIDEO,
+                theme::icon_font(40.0),
+                palette.text_secondary,
+            );
+            y += 48.0;
+        }
+        painter.text(
+            egui::pos2(center_x, y),
+            egui::Align2::CENTER_CENTER,
+            "No cameras yet",
+            theme::semibold(20.0),
+            palette.text,
+        );
+        y += 32.0;
+        painter.text(
+            egui::pos2(center_x, y),
+            egui::Align2::CENTER_CENTER,
+            "Use \"Scan network\" in the sidebar to find your cameras,",
+            egui::FontId::proportional(14.0),
+            palette.text_secondary,
+        );
+        y += 22.0;
+        painter.text(
+            egui::pos2(center_x, y),
+            egui::Align2::CENTER_CENTER,
+            "or \"Add camera\" to enter the address of one.",
+            egui::FontId::proportional(14.0),
+            palette.text_secondary,
+        );
+    }
+
+    /// Draws camera `index` in `rect` and tells its `StreamTask` the size at
+    /// which it is shown. Returns where the overlays were drawn.
+    fn paint_camera(
+        &self,
+        ui: &egui::Ui,
+        index: usize,
+        rect: egui::Rect,
+        state: TileState,
+    ) -> Overlays {
+        let camera = &self.cameras[index];
+        let key = &camera.id;
+        let status = self
+            .statuses
+            .get(key)
+            .copied()
+            .unwrap_or(ConnectionStatus::Disconnected);
+
+        let overlays = self.paint_tile(
+            ui,
+            rect,
+            self.textures.get(key),
+            status,
+            camera.name.as_deref(),
+            state,
+        );
+        self.report_display_size(key, rect.size(), ui.ctx().pixels_per_point());
+        overlays
     }
 
     /// Paints a `Camera_Tile` as a Windows 11 card: dark background with
-    /// rounded corners, the latest video fitted keeping its aspect ratio, the
-    /// camera name in a label in the bottom-left corner and the connection
-    /// status notice (Requirements 2.4, 2.5, 2.6).
+    /// rounded corners, the latest video drawn 1:1 when it matches the tile
+    /// (see `pixel::video_rect`) or fitted keeping its aspect ratio, the camera
+    /// name in a label in the bottom-left corner and the connection status
+    /// notice (Requirements 2.4, 2.5, 2.6).
     fn paint_tile(
         &self,
         ui: &egui::Ui,
@@ -1152,20 +1284,27 @@ impl SimpleRtspViewerApp {
         texture: Option<&egui::TextureHandle>,
         status: ConnectionStatus,
         name: Option<&str>,
-    ) {
+        state: TileState,
+    ) -> Overlays {
         let palette = &self.look.palette;
+        let ppp = ui.ctx().pixels_per_point();
         let painter = ui.painter().with_clip_rect(rect.expand(1.0));
         painter.rect_filled(rect, TILE_ROUNDING, palette.tile_background);
 
         if let Some(texture) = texture {
-            let mut video = egui::epaint::RectShape::filled(
-                fit_preserving_aspect(rect, texture.size_vec2()),
-                TILE_ROUNDING,
+            let video = pixel::video_rect(rect, texture.size_vec2(), ppp);
+            // The picture only has rounded corners when it reaches the tile's
+            // corners; with bars it sits inside them.
+            let covers_tile =
+                video.width() >= rect.width() - 2.0 && video.height() >= rect.height() - 2.0;
+            let mut shape = egui::epaint::RectShape::filled(
+                video,
+                if covers_tile { TILE_ROUNDING } else { 0.0 },
                 egui::Color32::WHITE,
             );
-            video.fill_texture_id = texture.id();
-            video.uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-            painter.add(video);
+            shape.fill_texture_id = texture.id();
+            shape.uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            painter.add(shape);
         }
 
         // Status notices: distinct from each other and from normal video, which
@@ -1175,11 +1314,13 @@ impl SimpleRtspViewerApp {
         let dim = |painter: &egui::Painter| {
             painter.rect_filled(rect, TILE_ROUNDING, egui::Color32::from_black_alpha(140));
         };
-        match grid::status_indicator(status) {
+        let pill = match grid::status_indicator(status) {
             grid::IndicatorKind::None => {
-                if !has_video {
+                if has_video {
+                    None
+                } else {
                     // Connected, but the first frame has not arrived yet.
-                    paint_status_pill(ui, &painter, rect, "Connecting…", None, true);
+                    paint_status_pill(ui, &painter, rect, "Connecting…", None, true)
                 }
             }
             grid::IndicatorKind::Reconnecting => {
@@ -1193,7 +1334,7 @@ impl SimpleRtspViewerApp {
                     "Reconnecting…",
                     Some(theme::CAUTION),
                     true,
-                );
+                )
             }
             grid::IndicatorKind::Disconnected if has_video => {
                 dim(&painter);
@@ -1204,24 +1345,50 @@ impl SimpleRtspViewerApp {
                     "Disconnected",
                     Some(theme::CRITICAL),
                     false,
-                );
+                )
             }
             grid::IndicatorKind::Disconnected => {
                 // Initial state: the first connection is still in progress.
-                paint_status_pill(ui, &painter, rect, "Connecting…", None, true);
+                paint_status_pill(ui, &painter, rect, "Connecting…", None, true)
             }
-        }
+        };
 
-        if let Some(name) = name {
+        let name_chip = name.and_then(|name| {
             let live = has_video && status == ConnectionStatus::Connected;
-            paint_name_chip(&painter, rect, name, live);
+            paint_name_chip(ui, &painter, rect, name, live, pill)
+        });
+
+        // The tile being dragged stays in place, dimmed.
+        if state.dimmed {
+            painter.rect_filled(rect, TILE_ROUNDING, egui::Color32::from_black_alpha(120));
         }
 
-        painter.rect_stroke(
-            rect,
-            TILE_ROUNDING,
-            egui::Stroke::new(1.0_f32, palette.tile_border),
-        );
+        // Border: exactly one physical pixel, a little more visible under the
+        // pointer, and in the accent color on the tile a drag would drop on.
+        if state.drop_target {
+            painter.rect_filled(rect, TILE_ROUNDING, palette.accent.gamma_multiply(0.18));
+            painter.rect_stroke(
+                snap_rect(rect, ppp).shrink(1.0 / ppp),
+                TILE_ROUNDING,
+                egui::Stroke::new(2.0 / ppp, palette.accent),
+            );
+        } else {
+            let color = if state.hovered {
+                palette.tile_border_hover
+            } else {
+                palette.tile_border
+            };
+            painter.rect_stroke(
+                border_rect(rect, ppp),
+                TILE_ROUNDING,
+                hairline_stroke(ppp, color),
+            );
+        }
+
+        Overlays {
+            status: pill,
+            name: name_chip,
+        }
     }
 
     /// Applies the `from`/`to` position swap to `self.cameras` and, if the
@@ -1481,99 +1648,11 @@ impl SimpleRtspViewerApp {
         self.dialog = None;
     }
 
-    /// Command bar at the top: title, camera count and the actions.
-    fn draw_command_bar(&mut self, ctx: &egui::Context) {
-        let palette = self.look.palette;
-        let icons = self.look.icons;
-        let bar = egui::Frame::none()
-            .fill(self.panel_fill())
-            .inner_margin(egui::Margin {
-                left: GAP + 8.0,
-                right: GAP,
-                top: GAP + 2.0,
-                bottom: 0.0,
-            });
-
-        let mut command = None;
-        egui::TopBottomPanel::top("command_bar")
-            .frame(bar)
-            .show_separator_line(false)
-            .show(ctx, |ui| {
-                ui.add_enabled_ui(self.dialog.is_none(), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("Cameras")
-                                .font(theme::semibold(18.0))
-                                .color(palette.text),
-                        );
-                        let total = self.cameras.len();
-                        if total > 0 {
-                            ui.label(
-                                egui::RichText::new(format!("{total}"))
-                                    .color(palette.text_secondary),
-                            );
-                        }
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let text = palette.text;
-                            if ui
-                                .add(command_button(
-                                    theme::ICON_KEY,
-                                    "Default login",
-                                    icons,
-                                    text,
-                                ))
-                                .clicked()
-                            {
-                                command = Some(Command::SharedLogin);
-                            }
-                            if ui
-                                .add(command_button(theme::ICON_IMPORT, "Import", icons, text))
-                                .clicked()
-                            {
-                                command = Some(Command::Import);
-                            }
-                            if ui
-                                .add(command_button(
-                                    theme::ICON_SEARCH,
-                                    "Scan network",
-                                    icons,
-                                    text,
-                                ))
-                                .clicked()
-                            {
-                                command = Some(Command::Scan);
-                            }
-                            let add = dialogs::accent_button("Add camera", &palette);
-                            if ui.add(add).clicked() {
-                                command = Some(Command::AddCamera);
-                            }
-                            if total > 0
-                                && ui
-                                    .add(command_button(
-                                        theme::ICON_REFRESH,
-                                        "Refresh",
-                                        icons,
-                                        text,
-                                    ))
-                                    .on_hover_text("Reconnect every camera")
-                                    .clicked()
-                            {
-                                command = Some(Command::Refresh);
-                            }
-                        });
-                    });
-                });
-            });
-
-        if let Some(command) = command {
-            self.run_command(command);
-        }
-    }
-
-    /// Notice bar (Windows 11 InfoBar) below the command bar: the missing
-    /// default login or the last error. It stays until closed; confirmations
-    /// are toasts instead (see `draw_toast`).
+    /// Notice bar (Windows 11 InfoBar) at the top of the content area: the
+    /// missing default login or the last error. It stays until closed;
+    /// confirmations are toasts instead (see `draw_toast`). The text wraps
+    /// inside the space left by the icon and the button, so nothing overlaps at
+    /// any window width.
     fn draw_notice_bar(&mut self, ctx: &egui::Context) {
         let palette = self.look.palette;
         let icons = self.look.icons;
@@ -1582,9 +1661,14 @@ impl SimpleRtspViewerApp {
             return;
         }
 
+        let ppp = ctx.pixels_per_point();
+        let skin = widgets::Skin {
+            palette: &palette,
+            icons,
+        };
         let mut define_login = false;
         let mut dismiss = false;
-        egui::TopBottomPanel::top("notice_bar")
+        let _bar = egui::TopBottomPanel::top("notice_bar")
             .frame(
                 egui::Frame::none()
                     .fill(self.panel_fill())
@@ -1612,46 +1696,67 @@ impl SimpleRtspViewerApp {
                             palette.accent,
                         ),
                     };
+                    let has_error = self.notice.is_some();
                     egui::Frame::none()
                         .fill(fill)
-                        .stroke(egui::Stroke::new(1.0_f32, palette.control_stroke))
+                        .stroke(hairline_stroke(ppp, palette.control_stroke))
                         .rounding(4.0)
                         .inner_margin(egui::Margin::symmetric(12.0, 8.0))
                         .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.spacing_mut().item_spacing.x = 8.0;
                             ui.horizontal(|ui| {
                                 if icons {
-                                    ui.label(
-                                        egui::RichText::new(icon)
-                                            .font(theme::icon_font(16.0))
-                                            .color(icon_color),
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(16.0, 16.0),
+                                        egui::Sense::hover(),
                                     );
+                                    widgets::paint_icon(ui, icon, 16.0, rect.center(), icon_color);
                                 }
-                                ui.label(egui::RichText::new(text).color(palette.text));
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
+                                // The button on the right has a known width; the
+                                // text gets all the rest and wraps inside it.
+                                let button_width = if has_error { 32.0 } else { 104.0 };
+                                let text_width =
+                                    (ui.available_width() - button_width - 8.0).max(40.0);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(text_width, 0.0),
+                                    egui::Layout::top_down(egui::Align::Min),
                                     |ui| {
-                                        if self.notice.is_some() {
-                                            let close = if icons {
-                                                egui::Button::new(
-                                                    egui::RichText::new(theme::ICON_CLOSE)
-                                                        .font(theme::icon_font(12.0)),
-                                                )
-                                            } else {
-                                                egui::Button::new("Close")
-                                            };
-                                            if ui.add(close.frame(false)).clicked() {
-                                                dismiss = true;
-                                            }
-                                        } else if ui.button("Set login").clicked() {
-                                            define_login = true;
-                                        }
+                                        ui.set_width(text_width);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(text).color(palette.text),
+                                            )
+                                            .wrap(),
+                                        );
                                     },
                                 );
+                                if has_error {
+                                    let close = widgets::icon_button(
+                                        ui,
+                                        &skin,
+                                        theme::ICON_CLOSE,
+                                        "x",
+                                        32.0,
+                                        false,
+                                        false,
+                                    )
+                                    .on_hover_text("Close");
+                                    if close.clicked() {
+                                        dismiss = true;
+                                    }
+                                } else if ui
+                                    .add_sized([button_width, 32.0], egui::Button::new("Set login"))
+                                    .clicked()
+                                {
+                                    define_login = true;
+                                }
                             });
                         });
                 });
             });
 
+        probe!(self.probe, "notice", _bar.response.rect);
         if dismiss {
             self.notice = None;
         }
@@ -1660,10 +1765,11 @@ impl SimpleRtspViewerApp {
         }
     }
 
-    /// Toast: a short confirmation popup, centered at the bottom of the window,
-    /// over everything else. It fades in, stays for `TOAST_DURATION` and fades
-    /// out by itself; it does not take clicks, so it never gets in the way of
-    /// the tiles under it.
+    /// Toast: a short confirmation popup, centered at the bottom of the
+    /// content area (not of the window: it never covers the sidebar), over
+    /// everything else. It fades in, stays for `TOAST_DURATION` and fades out
+    /// by itself; it does not take clicks, so it never gets in the way of the
+    /// tiles under it.
     fn draw_toast(&mut self, ctx: &egui::Context) {
         let Some(toast) = &self.toast else {
             return;
@@ -1675,9 +1781,17 @@ impl SimpleRtspViewerApp {
 
         let palette = self.look.palette;
         let icons = self.look.icons;
-        egui::Area::new(egui::Id::new("simple_rtsp_viewer_toast"))
+        let ppp = ctx.pixels_per_point();
+        let content = self.content_rect;
+        // Never wider than the content area, whatever the window size.
+        let max_width = TOAST_MAX_WIDTH.min((content.width() - 4.0 * GAP).max(120.0));
+        let _shown = egui::Area::new(egui::Id::new("simple_rtsp_viewer_toast"))
             .order(egui::Order::Tooltip)
-            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -(GAP * 3.0)])
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .fixed_pos(snap_pos(
+                egui::pos2(content.center().x, content.bottom() - 2.0 * GAP),
+                ppp,
+            ))
             .interactable(false)
             .show(ctx, |ui| {
                 // One opacity for everything drawn in the toast (background,
@@ -1685,7 +1799,7 @@ impl SimpleRtspViewerApp {
                 ui.set_opacity(opacity);
                 egui::Frame::none()
                     .fill(palette.dialog_background)
-                    .stroke(egui::Stroke::new(1.0_f32, palette.control_stroke))
+                    .stroke(hairline_stroke(ppp, palette.control_stroke))
                     .rounding(8.0)
                     .shadow(egui::epaint::Shadow {
                         offset: egui::vec2(0.0, 4.0),
@@ -1695,7 +1809,7 @@ impl SimpleRtspViewerApp {
                     })
                     .inner_margin(egui::Margin::symmetric(16.0, 10.0))
                     .show(ui, |ui| {
-                        ui.set_max_width(TOAST_MAX_WIDTH);
+                        ui.set_max_width(max_width);
                         ui.horizontal(|ui| {
                             if icons {
                                 ui.label(
@@ -1704,10 +1818,16 @@ impl SimpleRtspViewerApp {
                                         .color(palette.success_text),
                                 );
                             }
-                            ui.label(egui::RichText::new(&toast.text).color(palette.text));
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&toast.text).color(palette.text),
+                                )
+                                .wrap(),
+                            );
                         });
                     });
             });
+        probe!(self.probe, "toast", _shown.response.rect);
 
         // Keeps the fade animation running while nothing else repaints.
         ctx.request_repaint_after(Duration::from_millis(16));
@@ -1747,44 +1867,6 @@ impl SimpleRtspViewerApp {
     }
 }
 
-/// Command bar button: Windows icon (if the font exists) and text.
-fn command_button(
-    icon: &str,
-    text: &str,
-    icons: bool,
-    color: egui::Color32,
-) -> egui::Button<'static> {
-    let label: egui::WidgetText = if icons {
-        // A text with two fonts (icon and text); the colors of a `LayoutJob` do
-        // not come from the theme, so the color is passed in.
-        let mut job = egui::text::LayoutJob::default();
-        job.append(
-            icon,
-            0.0,
-            egui::TextFormat {
-                font_id: theme::icon_font(14.0),
-                color,
-                valign: egui::Align::Center,
-                ..Default::default()
-            },
-        );
-        job.append(
-            text,
-            8.0,
-            egui::TextFormat {
-                font_id: egui::FontId::proportional(14.0),
-                color,
-                valign: egui::Align::Center,
-                ..Default::default()
-            },
-        );
-        job.into()
-    } else {
-        text.to_owned().into()
-    };
-    egui::Button::new(label).min_size(egui::vec2(0.0, 32.0))
-}
-
 impl eframe::App for SimpleRtspViewerApp {
     /// Color the window is cleared with before each frame: transparent with
     /// Mica (so the effect shows), the theme background color without it.
@@ -1800,20 +1882,40 @@ impl eframe::App for SimpleRtspViewerApp {
     }
 
     /// Main UI loop, called on every `eframe` frame. Drains the pending events
-    /// of each camera, redraws the grid (handling drag-and-drop) and requests
-    /// an immediate repaint, to keep the video display responsive even without
-    /// user interaction (Requirements 2.4, 2.7, 3.5).
+    /// of each camera, redraws the interface (handling drag-and-drop) and
+    /// requests an immediate repaint, to keep the video display responsive even
+    /// without user interaction (Requirements 2.4, 2.7, 3.5).
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.sync_theme(ctx, frame);
+        let received_update = self.ui(ctx);
+        self.schedule_repaint(ctx, received_update);
+    }
+}
+
+impl SimpleRtspViewerApp {
+    /// Draws one frame of the interface, from the cameras' events to the
+    /// dialogs. Returns whether a frame or a status change arrived. Separate
+    /// from `update` (which also follows the system theme) so the layout tests
+    /// can run it without a window.
+    ///
+    /// Order matters: the panels take their space from the window in the order
+    /// they are drawn (the sidebar first, then the notice bar, then what is
+    /// left for the content), and the dialog and the toast are drawn last, over
+    /// everything.
+    fn ui(&mut self, ctx: &egui::Context) -> bool {
         let received_update = self.drain_camera_events(ctx);
-        self.draw_command_bar(ctx);
+        self.draw_sidebar(ctx);
         self.draw_notice_bar(ctx);
-        self.draw_grid(ctx);
-        // Last: the grid sees the open dialog and stays inactive in this frame,
-        // even if the dialog closes now (e.g. Esc belongs only to the dialog).
+        self.draw_content(ctx);
+        // After the content, which sees the open dialog and stays inactive in
+        // this frame even if the dialog closes now (e.g. Esc belongs only to the
+        // dialog).
         self.draw_dialog(ctx);
         self.draw_toast(ctx);
+        received_update
+    }
 
+    fn schedule_repaint(&self, ctx: &egui::Context, received_update: bool) {
         // Avoids a continuous repaint busy-loop (which would keep CPU/GPU
         // always busy, against Requirements 7.2/7.3). egui already schedules an
         // immediate repaint in response to user interaction (e.g.
@@ -1839,10 +1941,12 @@ impl eframe::App for SimpleRtspViewerApp {
 }
 
 #[cfg(test)]
+mod layout_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::CameraAuth;
-    use proptest::prelude::*;
 
     fn camera(url: &str) -> Camera {
         Camera {
@@ -1892,17 +1996,17 @@ mod tests {
     }
 
     #[test]
-    fn display_size_is_in_physical_pixels_rounded_up_to_the_step() {
-        // 300x170 points on a screen with 1.5 scale = 450x255 pixels ->
-        // 480x256.
+    fn display_size_is_the_exact_tile_size_in_even_physical_pixels() {
+        // 300x170 points on a screen with 1.5 scale = 450x255 pixels: never
+        // larger than the tile, even numbers -> 450x254.
         assert_eq!(
             display_size_for(egui::vec2(300.0, 170.0), 1.5),
             DisplaySize {
-                width: 480,
-                height: 256
+                width: 450,
+                height: 254
             }
         );
-        // Exact multiples of the step do not change.
+        // An exact size does not change.
         assert_eq!(
             display_size_for(egui::vec2(640.0, 352.0), 1.0),
             DisplaySize {
@@ -1910,12 +2014,21 @@ mod tests {
                 height: 352
             }
         );
-        // An empty tile (minimized window) still asks for at least one step.
+        // A tile slightly short of a whole pixel does not round up: the frame
+        // would then be larger than the tile and have to be resampled.
+        assert_eq!(
+            display_size_for(egui::vec2(640.9, 360.9), 1.0),
+            DisplaySize {
+                width: 640,
+                height: 360
+            }
+        );
+        // An empty tile (minimized window) still asks for at least 2x2.
         assert_eq!(
             display_size_for(egui::vec2(0.0, 0.0), 1.0),
             DisplaySize {
-                width: DISPLAY_SIZE_STEP,
-                height: DISPLAY_SIZE_STEP
+                width: 2,
+                height: 2
             }
         );
     }
@@ -2220,84 +2333,6 @@ mod tests {
                 .collect();
             assert_eq!(shown, ["c", "b", "a"]);
         });
-    }
-
-    fn rect(x: f32, y: f32, w: f32, h: f32) -> egui::Rect {
-        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h))
-    }
-
-    fn assert_rect_close(actual: egui::Rect, expected: egui::Rect) {
-        let close = (actual.min - expected.min).length() < 1e-3
-            && (actual.max - expected.max).length() < 1e-3;
-        assert!(close, "expected {expected:?}, got {actual:?}");
-    }
-
-    #[test]
-    fn wide_video_in_square_block_gets_bars_above_and_below() {
-        // 16:9 in a 400x400 tile: fills the whole width, height 225, centered.
-        let fitted =
-            fit_preserving_aspect(rect(0.0, 0.0, 400.0, 400.0), egui::vec2(1920.0, 1080.0));
-        assert_rect_close(fitted, rect(0.0, 87.5, 400.0, 225.0));
-    }
-
-    #[test]
-    fn tall_video_in_wide_block_gets_bars_on_the_sides() {
-        // 9:16 in an offset 800x450 tile: fills the whole height, width 450 *
-        // 9/16 = 253.125, centered at x = 10 + 400.
-        let fitted =
-            fit_preserving_aspect(rect(10.0, 20.0, 800.0, 450.0), egui::vec2(1080.0, 1920.0));
-        let width = 450.0 * 1080.0 / 1920.0;
-        assert_rect_close(fitted, rect(410.0 - width / 2.0, 20.0, width, 450.0));
-    }
-
-    #[test]
-    fn invalid_sizes_return_the_container() {
-        let container = rect(0.0, 0.0, 300.0, 200.0);
-        assert_eq!(
-            fit_preserving_aspect(container, egui::vec2(0.0, 1080.0)),
-            container
-        );
-        assert_eq!(
-            fit_preserving_aspect(container, egui::vec2(1920.0, 0.0)),
-            container
-        );
-        let empty = rect(5.0, 5.0, 0.0, 100.0);
-        assert_eq!(
-            fit_preserving_aspect(empty, egui::vec2(1920.0, 1080.0)),
-            empty
-        );
-    }
-
-    proptest! {
-        // The fitted video keeps the original aspect ratio, fits in the tile,
-        // is centered and fills the whole tile in at least one dimension.
-        // Realistic size ranges (aspect ratio up to 80:1) keep the f32 rounding
-        // error well below the tolerances.
-        #[test]
-        fn property_fit_preserving_aspect(
-            x in -500.0f32..500.0,
-            y in -500.0f32..500.0,
-            container_w in 50.0f32..4000.0,
-            container_h in 50.0f32..4000.0,
-            content_w in 100.0f32..8000.0,
-            content_h in 100.0f32..8000.0,
-        ) {
-            let container = rect(x, y, container_w, container_h);
-            let fitted = fit_preserving_aspect(container, egui::vec2(content_w, content_h));
-            let tolerance = 1e-2 * container_w.max(container_h);
-
-            let content_aspect = content_w / content_h;
-            let fitted_aspect = fitted.width() / fitted.height();
-            prop_assert!((fitted_aspect - content_aspect).abs() <= 5e-3 * content_aspect);
-
-            prop_assert!(fitted.width() <= container_w + tolerance);
-            prop_assert!(fitted.height() <= container_h + tolerance);
-            prop_assert!((fitted.center() - container.center()).length() <= tolerance);
-            prop_assert!(
-                (fitted.width() - container_w).abs() <= tolerance
-                    || (fitted.height() - container_h).abs() <= tolerance
-            );
-        }
     }
 
     #[test]

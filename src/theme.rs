@@ -31,6 +31,8 @@ pub const ICON_WARNING: &str = "\u{E7BA}";
 pub const ICON_SUCCESS: &str = "\u{E73E}";
 pub const ICON_CLOSE: &str = "\u{E711}";
 pub const ICON_REFRESH: &str = "\u{E72C}";
+pub const ICON_ADD: &str = "\u{E710}";
+pub const ICON_MENU: &str = "\u{E700}";
 pub const ICON_VOLUME: &str = "\u{E767}";
 pub const ICON_MUTE: &str = "\u{E74F}";
 
@@ -73,6 +75,18 @@ pub struct Palette {
     /// Backgrounds of the notice bar (InfoBar): info and error.
     pub notice_info: Color32,
     pub notice_error: Color32,
+    /// Sidebar items: background under the pointer and when selected. They are
+    /// translucent, like the Windows 11 navigation items, so they work both on
+    /// Mica and on the solid fallback background.
+    pub item_hover: Color32,
+    pub item_selected: Color32,
+    /// Cards inside the sidebar (the "Viewing" card).
+    pub card_background: Color32,
+    /// Thin lines between sidebar sections.
+    pub divider: Color32,
+    /// Off state of a switch: border, and the knob.
+    pub switch_off_stroke: Color32,
+    pub switch_off_knob: Color32,
 }
 
 impl Palette {
@@ -98,6 +112,12 @@ impl Palette {
                 critical_text: CRITICAL,
                 notice_info: Color32::from_rgb(0x2B, 0x2B, 0x2B),
                 notice_error: Color32::from_rgb(0x44, 0x27, 0x26),
+                item_hover: Color32::from_white_alpha(12),
+                item_selected: Color32::from_white_alpha(20),
+                card_background: Color32::from_white_alpha(10),
+                divider: Color32::from_white_alpha(20),
+                switch_off_stroke: Color32::from_white_alpha(140),
+                switch_off_knob: Color32::from_white_alpha(200),
             }
         } else {
             Self {
@@ -120,6 +140,12 @@ impl Palette {
                 critical_text: Color32::from_rgb(0xC4, 0x2B, 0x1C),
                 notice_info: Color32::from_rgb(0xF6, 0xF6, 0xF6),
                 notice_error: Color32::from_rgb(0xFD, 0xE7, 0xE9),
+                item_hover: Color32::from_black_alpha(10),
+                item_selected: Color32::from_black_alpha(16),
+                card_background: Color32::from_rgba_unmultiplied(255, 255, 255, 150),
+                divider: Color32::from_black_alpha(24),
+                switch_off_stroke: Color32::from_black_alpha(130),
+                switch_off_knob: Color32::from_black_alpha(160),
             }
         }
     }
@@ -127,7 +153,7 @@ impl Palette {
 
 /// Mixes `from` with `to` in the `amount` ratio (0 = only `from`, 1 = only
 /// `to`).
-fn mix(from: Color32, to: Color32, amount: f32) -> Color32 {
+pub fn mix(from: Color32, to: Color32, amount: f32) -> Color32 {
     let channel = |a: u8, b: u8| {
         let mixed = f32::from(a) + (f32::from(b) - f32::from(a)) * amount;
         mixed.round().clamp(0.0, 255.0) as u8
