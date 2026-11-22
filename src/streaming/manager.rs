@@ -21,8 +21,10 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
+use crate::audio::AudioSink;
 use crate::model::{CameraFrame, ConnectionStatus, DisplaySize};
 
+use super::audio_decode::AudioDecoder;
 use super::scale::output_size;
 use super::state::{
     backoff_delay, next_connection_state, ConnectionEvent, DEFAULT_MAX_BACKOFF_DELAY,
@@ -58,6 +60,13 @@ pub struct StreamChannels {
     /// Maximum size at which the UI shows the video (`None` = source
     /// resolution). Read on every frame, so it follows window resizes.
     pub display_size: watch::Receiver<Option<DisplaySize>>,
+    /// Where to play this stream's sound: `Some` while the camera is enlarged
+    /// and not muted, `None` otherwise. With `None` the audio packets are
+    /// dropped without being decoded.
+    pub audio: watch::Receiver<Option<AudioSink>>,
+    /// Whether the stream has an audio track the app can decode. Published
+    /// after each connection, for the UI to show the sound controls.
+    pub has_audio: watch::Sender<bool>,
 }
 
 /// Command sent to the `Stream_Manager` orchestrator loop through the internal
@@ -438,6 +447,19 @@ fn decode_stream(
         }
     };
 
+    // The audio track, if the session has one we can decode. Its packets are
+    // read together with the video; they are only decoded while the UI hands
+    // this stream a sink (the camera is enlarged and not muted).
+    let audio_stream = input_ctx
+        .streams()
+        .best(ffmpeg_next::media::Type::Audio)
+        .map(|stream| (stream.index(), stream.parameters()));
+    let audio_index = audio_stream.as_ref().map(|(index, _)| *index);
+    let mut audio = audio_stream
+        .as_ref()
+        .and_then(|(_, parameters)| AudioDecoder::new(parameters));
+    channels.has_audio.send_replace(audio.is_some());
+
     // Current pixel converter and the configuration it was created for: source
     // format and size, output size.
     let mut scaler: Option<(ScalerConfig, ffmpeg_next::software::scaling::Context)> = None;
@@ -481,6 +503,16 @@ fn decode_stream(
                 tracing::error!(rtsp_url = %safe_url, error = %err, "failed to read a packet from the RTSP stream");
                 return StopReason::Failure;
             }
+        }
+
+        if Some(packet.stream()) == audio_index {
+            if let Some(audio) = audio.as_mut() {
+                // Cloning the `Option<AudioSink>` is just an `Arc` clone; the
+                // borrow of the watch value must not outlive the call.
+                let sink = channels.audio.borrow().clone();
+                audio.process(&packet, sink.as_ref());
+            }
+            continue;
         }
 
         if packet.stream() != video_stream_index {
@@ -747,10 +779,16 @@ mod tests {
     ) {
         let (status_tx, status_rx) = watch::channel(ConnectionStatus::Disconnected);
         let (display_tx, display_rx) = watch::channel(None);
+        // No sound in these tests: the audio sender can go away, the receiver
+        // keeps returning `None`.
+        let (_audio_tx, audio_rx) = watch::channel(None);
+        let (has_audio_tx, _has_audio_rx) = watch::channel(false);
         let channels = StreamChannels {
             frames,
             status: status_tx,
             display_size: display_rx,
+            audio: audio_rx,
+            has_audio: has_audio_tx,
         };
         (channels, status_rx, display_tx)
     }

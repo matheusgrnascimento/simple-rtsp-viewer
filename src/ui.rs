@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
 
+use crate::audio::{self, AudioOutput, AudioSink};
 use crate::credentials;
 use crate::dialogs::{self, CameraForm, Dialog, DialogAction, DialogEnv, LoginForm, ScanDialog};
 use crate::grid;
@@ -97,6 +98,41 @@ struct ActiveStream {
     status: watch::Receiver<ConnectionStatus>,
     /// Size at which the camera is being shown, read by the `StreamTask`.
     display_size: watch::Sender<Option<DisplaySize>>,
+    /// Where the `StreamTask` plays this stream's sound: `Some` only while the
+    /// camera is enlarged and not muted.
+    audio: watch::Sender<Option<AudioSink>>,
+    /// The stream has an audio track the app can decode.
+    has_audio: watch::Receiver<bool>,
+}
+
+/// Sound of the enlarged camera: the output device, opened the first time it
+/// is needed, and the user's mute and volume choices (kept while the app is
+/// open, across cameras).
+struct AudioState {
+    output: Option<AudioOutput>,
+    /// Opens the output device. A field so tests do not touch a real device.
+    open: fn() -> Result<AudioOutput, String>,
+    /// Opening the device failed; remembered so the error shows once, not on
+    /// every enlarge.
+    open_failed: bool,
+    /// The device is running (a camera is enlarged and not muted).
+    playing: bool,
+    muted: bool,
+    /// Volume from 0 to 1.
+    volume: f32,
+}
+
+impl AudioState {
+    fn new() -> Self {
+        Self {
+            output: None,
+            open: AudioOutput::open,
+            open_failed: false,
+            playing: false,
+            muted: false,
+            volume: audio::DEFAULT_VOLUME,
+        }
+    }
 }
 
 /// What the user did on a grid tile in this frame.
@@ -298,6 +334,8 @@ pub struct SimpleRtspViewerApp {
     notice: Option<Notice>,
     /// Confirmation toast on screen, if any.
     toast: Option<Toast>,
+    /// Sound of the enlarged camera.
+    audio: AudioState,
     /// Windows 11 look in use.
     look: Look,
 }
@@ -358,6 +396,7 @@ impl SimpleRtspViewerApp {
             dialog: None,
             notice: None,
             toast: None,
+            audio: AudioState::new(),
             look: Look::new(true),
         };
         app.rebuild_cameras();
@@ -397,6 +436,7 @@ impl SimpleRtspViewerApp {
             self.enlarged = None;
         }
         self.sync_streams();
+        self.sync_audio();
     }
 
     /// Applies the Windows 11 look when the window is created: system fonts,
@@ -482,6 +522,11 @@ impl SimpleRtspViewerApp {
             .streams
             .get(key)
             .and_then(|stream| *stream.display_size.borrow());
+        // The sound controls stay on screen while the stream switches.
+        let had_audio = self
+            .streams
+            .get(key)
+            .is_some_and(|stream| *stream.has_audio.borrow());
 
         if let Some(previous) = self.streams.remove(key) {
             self.stream_manager_handle.remove_stream(previous.url);
@@ -490,12 +535,17 @@ impl SimpleRtspViewerApp {
         let (frame_tx, frame_rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
         let (status_tx, status_rx) = watch::channel(current_status);
         let (display_tx, display_rx) = watch::channel(current_display);
+        // The new stream of the enlarged camera keeps playing its sound.
+        let (audio_tx, audio_rx) = watch::channel(self.current_audio_sink(key));
+        let (has_audio_tx, has_audio_rx) = watch::channel(had_audio);
         self.stream_manager_handle.add_stream(
             url.clone(),
             StreamChannels {
                 frames: frame_tx,
                 status: status_tx,
                 display_size: display_rx,
+                audio: audio_rx,
+                has_audio: has_audio_tx,
             },
         );
         self.streams.insert(
@@ -505,8 +555,78 @@ impl SimpleRtspViewerApp {
                 frames: frame_rx,
                 status: status_rx,
                 display_size: display_tx,
+                audio: audio_tx,
+                has_audio: has_audio_rx,
             },
         );
+    }
+
+    /// Where camera `key` plays its sound: the output's sink for the enlarged
+    /// camera while it is not muted, nowhere for all the others.
+    fn current_audio_sink(&self, key: &str) -> Option<AudioSink> {
+        if self.audio.muted || self.enlarged.as_deref() != Some(key) {
+            return None;
+        }
+        self.audio.output.as_ref().map(AudioOutput::sink)
+    }
+
+    /// Opens the audio output if it is not open yet. A failure (no output
+    /// device) shows an error once and leaves the cameras without sound.
+    fn ensure_audio_output(&mut self) {
+        if self.audio.output.is_some() {
+            return;
+        }
+        match (self.audio.open)() {
+            Ok(output) => {
+                output.set_volume(self.audio.volume);
+                self.audio.output = Some(output);
+                self.audio.open_failed = false;
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "audio output unavailable");
+                if !self.audio.open_failed {
+                    self.show_notice(
+                        NoticeKind::Error,
+                        format!("The camera sound is unavailable: {err}"),
+                    );
+                }
+                self.audio.open_failed = true;
+            }
+        }
+    }
+
+    /// Brings the sound in line with what is on screen: the device runs, and
+    /// the enlarged camera's stream gets the sink, only while a camera is
+    /// enlarged and not muted. Every other stream gets none, so its audio
+    /// packets are dropped without decoding.
+    fn sync_audio(&mut self) {
+        let playing = self.enlarged.is_some() && !self.audio.muted;
+        if playing {
+            self.ensure_audio_output();
+        }
+        if let Some(output) = &self.audio.output {
+            if playing != self.audio.playing {
+                output.set_active(playing);
+            }
+            self.audio.playing = playing;
+        }
+        for (key, stream) in &self.streams {
+            stream.audio.send_replace(self.current_audio_sink(key));
+        }
+    }
+
+    fn set_muted(&mut self, muted: bool) {
+        if self.audio.muted != muted {
+            self.audio.muted = muted;
+            self.sync_audio();
+        }
+    }
+
+    fn set_volume(&mut self, volume: f32) {
+        self.audio.volume = volume.clamp(0.0, 1.0);
+        if let Some(output) = &self.audio.output {
+            output.set_volume(self.audio.volume);
+        }
     }
 
     /// Enlarges camera `key` (or goes back to the grid, with `None`) and
@@ -517,6 +637,7 @@ impl SimpleRtspViewerApp {
             self.enlarged = key;
             self.high_resolution = false;
             self.sync_streams();
+            self.sync_audio();
         }
     }
 
@@ -726,11 +847,86 @@ impl SimpleRtspViewerApp {
             }
         }
 
+        self.paint_audio_controls(ui, rect, index);
+
         // With a dialog open the area is inactive and Esc belongs to the
         // dialog.
         let escape = ui.is_enabled() && ui.input(|input| input.key_pressed(egui::Key::Escape));
         if response.double_clicked() || escape {
             self.set_enlarged(None);
+        }
+    }
+
+    /// Sound controls of the enlarged camera, in its bottom-left corner: a
+    /// mute button and the volume. Shown only when the stream has audio the app
+    /// can decode and the output device could be opened.
+    fn paint_audio_controls(&mut self, ui: &mut egui::Ui, rect: egui::Rect, index: usize) {
+        let has_audio = self
+            .streams
+            .get(&self.cameras[index].id)
+            .is_some_and(|stream| *stream.has_audio.borrow());
+        if !has_audio || self.audio.open_failed {
+            return;
+        }
+
+        let icons = self.look.icons;
+        let muted = self.audio.muted;
+        let mut volume = self.audio.volume;
+        let mut toggle_mute = false;
+        let white = egui::Color32::WHITE;
+
+        // Added after the tile, so it sits on top and takes the clicks.
+        ui.allocate_ui_at_rect(rect.shrink(12.0), |ui| {
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Max), |ui| {
+                egui::Frame::none()
+                    .fill(theme::OVERLAY_CHIP)
+                    .rounding(6.0)
+                    .inner_margin(egui::Margin::symmetric(4.0, 0.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (label, tip) = match (muted, icons) {
+                                (true, true) => (
+                                    egui::RichText::new(theme::ICON_MUTE)
+                                        .font(theme::icon_font(16.0)),
+                                    "Turn the sound on",
+                                ),
+                                (false, true) => (
+                                    egui::RichText::new(theme::ICON_VOLUME)
+                                        .font(theme::icon_font(16.0)),
+                                    "Mute",
+                                ),
+                                (true, false) => {
+                                    (egui::RichText::new("Unmute"), "Turn the sound on")
+                                }
+                                (false, false) => (egui::RichText::new("Mute"), "Mute"),
+                            };
+                            let button = egui::Button::new(label.color(white))
+                                .frame(false)
+                                .min_size(egui::vec2(32.0, 32.0));
+                            if ui.add(button).on_hover_text(tip).clicked() {
+                                toggle_mute = true;
+                            }
+
+                            ui.spacing_mut().slider_width = 100.0;
+                            let slider = egui::Slider::new(&mut volume, 0.0..=1.0)
+                                .show_value(false)
+                                .trailing_fill(true);
+                            // Greyed out while muted: the button unmutes.
+                            ui.add_enabled(!muted, slider).on_hover_text(
+                                "Volume. Half way is the camera's original level; \
+                                 the right half boosts quiet microphones.",
+                            );
+                            ui.add_space(8.0);
+                        });
+                    });
+            });
+        });
+
+        if toggle_mute {
+            self.set_muted(!muted);
+        }
+        if volume != self.audio.volume {
+            self.set_volume(volume);
         }
     }
 
@@ -1686,6 +1882,8 @@ mod tests {
             own: HashMap::new(),
         };
         let mut app = SimpleRtspViewerApp::new(library, handle.clone());
+        // Never open the real audio device in tests.
+        app.audio.open = || Ok(AudioOutput::detached(48_000));
         test(&mut app);
         drop(app);
         runtime.block_on(handle.shutdown());
@@ -1782,6 +1980,125 @@ mod tests {
             assert!(!app.statuses.contains_key("a"));
             assert_eq!(app.enlarged, None);
             assert_eq!(app.cameras.len(), 1);
+        });
+    }
+
+    fn sink_of(app: &SimpleRtspViewerApp, id: &str) -> Option<AudioSink> {
+        app.streams[id].audio.borrow().clone()
+    }
+
+    #[test]
+    fn sound_follows_the_enlarged_camera_and_the_mute_button() {
+        let cameras = vec![
+            stored("a", "/main-a", Some("/sub-a")),
+            stored("b", "/main-b", None),
+        ];
+        with_app(cameras, |app| {
+            // In the grid nobody plays, and the device is not even opened.
+            assert!(sink_of(app, "a").is_none() && sink_of(app, "b").is_none());
+            assert!(app.audio.output.is_none());
+            assert!(!app.audio.playing);
+
+            // Enlarging starts only that camera's sound.
+            app.set_enlarged(Some("a".to_string()));
+            assert!(sink_of(app, "a").is_some());
+            assert!(sink_of(app, "b").is_none());
+            assert!(app.audio.playing);
+
+            // Muting stops it (the stream drops the audio packets); unmuting
+            // brings it back.
+            app.set_muted(true);
+            assert!(sink_of(app, "a").is_none());
+            assert!(!app.audio.playing);
+            app.set_muted(false);
+            assert!(sink_of(app, "a").is_some());
+            assert!(app.audio.playing);
+
+            // Switching to the main stream opens a new stream that keeps the
+            // sound, and so does a refresh.
+            let before = app.streams["a"].url.clone();
+            app.set_high_resolution(true);
+            assert_ne!(app.streams["a"].url, before);
+            assert!(sink_of(app, "a").is_some());
+            app.refresh_streams();
+            assert!(sink_of(app, "a").is_some());
+
+            // Enlarging another camera moves the sound to it.
+            app.set_enlarged(Some("b".to_string()));
+            assert!(sink_of(app, "a").is_none());
+            assert!(sink_of(app, "b").is_some());
+
+            // Back to the grid: silence, and the device is paused.
+            app.set_enlarged(None);
+            assert!(sink_of(app, "a").is_none() && sink_of(app, "b").is_none());
+            assert!(!app.audio.playing);
+        });
+    }
+
+    #[test]
+    fn mute_and_volume_are_kept_across_cameras() {
+        with_app(
+            vec![stored("a", "/a", None), stored("b", "/b", None)],
+            |app| {
+                app.set_enlarged(Some("a".to_string()));
+                app.set_muted(true);
+                app.set_volume(0.4);
+
+                // Still muted on the next camera, and the volume stays.
+                app.set_enlarged(Some("b".to_string()));
+                assert!(sink_of(app, "b").is_none());
+                assert_eq!(app.audio.volume, 0.4);
+
+                // Out-of-range volumes are clamped.
+                app.set_volume(3.0);
+                assert_eq!(app.audio.volume, 1.0);
+            },
+        );
+    }
+
+    #[test]
+    fn removing_the_enlarged_camera_stops_the_sound() {
+        with_app(
+            vec![stored("a", "/a", None), stored("b", "/b", None)],
+            |app| {
+                app.set_enlarged(Some("a".to_string()));
+                assert!(app.audio.playing);
+
+                app.library.data.cameras.retain(|camera| camera.id != "a");
+                app.rebuild_cameras();
+                assert_eq!(app.enlarged, None);
+                assert!(!app.audio.playing);
+                assert!(sink_of(app, "b").is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn a_missing_audio_device_is_reported_once_and_cameras_stay_silent() {
+        with_app(vec![stored("a", "/a", None)], |app| {
+            app.audio.open = || Err("no audio output device".to_string());
+
+            app.set_enlarged(Some("a".to_string()));
+            assert!(app.audio.open_failed);
+            assert!(sink_of(app, "a").is_none());
+            let first = app.notice.as_ref().map(|notice| notice.text.clone());
+            assert_eq!(
+                first.as_deref(),
+                Some("The camera sound is unavailable: no audio output device")
+            );
+
+            // Enlarging again does not repeat the error.
+            app.notice = None;
+            app.set_enlarged(None);
+            app.set_enlarged(Some("a".to_string()));
+            assert!(app.notice.is_none());
+
+            // Once the device works, the next enlarge brings the sound.
+            app.audio.open = || Ok(AudioOutput::detached(48_000));
+            app.set_enlarged(None);
+            app.set_enlarged(Some("a".to_string()));
+            assert!(!app.audio.open_failed);
+            assert!(sink_of(app, "a").is_some());
         });
     }
 

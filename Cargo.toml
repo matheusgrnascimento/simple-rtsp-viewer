@@ -25,6 +25,8 @@ rfd = "0.17.2"
 window-vibrancy = "0.8"
 # IPv4 addresses of the network interfaces, to know which subnets to scan.
 if-addrs = "0.15"
+# Audio output (WASAPI on Windows) for the enlarged camera's sound.
+cpal = "0.18"
 # System credential vault: only the Windows Credential Manager, without the
 # Linux/macOS backends and their dependencies.
 keyring = { version = "3", default-features = false, features = ["windows-native"] }

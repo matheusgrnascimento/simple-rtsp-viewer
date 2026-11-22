@@ -2,6 +2,7 @@
 // window next to the app. Debug builds keep the console for the logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audio;
 mod credentials;
 mod dialogs;
 mod discovery;

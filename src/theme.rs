@@ -31,6 +31,8 @@ pub const ICON_WARNING: &str = "\u{E7BA}";
 pub const ICON_SUCCESS: &str = "\u{E73E}";
 pub const ICON_CLOSE: &str = "\u{E711}";
 pub const ICON_REFRESH: &str = "\u{E72C}";
+pub const ICON_VOLUME: &str = "\u{E767}";
+pub const ICON_MUTE: &str = "\u{E74F}";
 
 /// Semibold font family, used in titles.
 const SEMIBOLD: &str = "semibold";
