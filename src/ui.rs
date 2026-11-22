@@ -27,9 +27,27 @@ use crate::store::{self, CameraLibrary};
 use crate::streaming::{StreamChannels, StreamManagerHandle};
 use crate::theme;
 
-/// How long a confirmation (success) message stays in the notice bar; error
-/// messages stay until they are closed.
-const NOTICE_DURATION: Duration = Duration::from_secs(6);
+/// How long a toast (the short confirmation popup) stays on screen, counting
+/// its fade in and fade out. Error messages are not toasts: they stay in the
+/// notice bar until closed.
+const TOAST_DURATION: Duration = Duration::from_millis(2800);
+const TOAST_FADE_IN: Duration = Duration::from_millis(150);
+const TOAST_FADE_OUT: Duration = Duration::from_millis(350);
+
+/// Maximum width of a toast; longer messages wrap.
+const TOAST_MAX_WIDTH: f32 = 420.0;
+
+/// Opacity (0 to 1) of a toast `elapsed` after it appeared, or `None` once its
+/// duration is over: it fades in, stays solid, then fades out.
+fn toast_opacity(elapsed: Duration) -> Option<f32> {
+    if elapsed >= TOAST_DURATION {
+        return None;
+    }
+    let fade_in = (elapsed.as_secs_f32() / TOAST_FADE_IN.as_secs_f32()).min(1.0);
+    let remaining = TOAST_DURATION - elapsed;
+    let fade_out = (remaining.as_secs_f32() / TOAST_FADE_OUT.as_secs_f32()).min(1.0);
+    Some(fade_in.min(fade_out))
+}
 
 /// Space between the camera tiles and around the grid, as between Windows 11
 /// cards.
@@ -106,17 +124,26 @@ enum Command {
     Refresh,
 }
 
-/// Message in the notice bar, below the command bar.
+/// Error message in the notice bar, below the command bar. It stays until the
+/// user closes it.
 struct Notice {
-    kind: NoticeKind,
     text: String,
-    /// When the message appeared (success messages go away on their own).
+}
+
+/// Short confirmation popup at the bottom of the window. It goes away on its
+/// own after `TOAST_DURATION`.
+struct Toast {
+    text: String,
+    /// When the toast appeared.
     since: Instant,
 }
 
+/// How a message is shown to the user.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NoticeKind {
+    /// Something worked: a short toast that disappears by itself.
     Success,
+    /// Something failed: the notice bar, which stays until closed.
     Error,
 }
 
@@ -267,8 +294,10 @@ pub struct SimpleRtspViewerApp {
     library: CameraLibrary,
     /// Open dialog, if any.
     dialog: Option<Dialog>,
-    /// Message in the notice bar, if any.
+    /// Error message in the notice bar, if any.
     notice: Option<Notice>,
+    /// Confirmation toast on screen, if any.
+    toast: Option<Toast>,
     /// Windows 11 look in use.
     look: Look,
 }
@@ -328,6 +357,7 @@ impl SimpleRtspViewerApp {
             library,
             dialog: None,
             notice: None,
+            toast: None,
             look: Look::new(true),
         };
         app.rebuild_cameras();
@@ -1071,12 +1101,19 @@ impl SimpleRtspViewerApp {
         }
     }
 
+    /// Shows a message: a success as a short toast, an error in the notice bar.
+    /// A new toast replaces the one on screen.
     fn show_notice(&mut self, kind: NoticeKind, text: impl Into<String>) {
-        self.notice = Some(Notice {
-            kind,
-            text: text.into(),
-            since: Instant::now(),
-        });
+        let text = text.into();
+        match kind {
+            NoticeKind::Success => {
+                self.toast = Some(Toast {
+                    text,
+                    since: Instant::now(),
+                });
+            }
+            NoticeKind::Error => self.notice = Some(Notice { text }),
+        }
     }
 
     /// Runs a command from the command bar.
@@ -1339,14 +1376,9 @@ impl SimpleRtspViewerApp {
     }
 
     /// Notice bar (Windows 11 InfoBar) below the command bar: the missing
-    /// default login or the app's last message.
+    /// default login or the last error. It stays until closed; confirmations
+    /// are toasts instead (see `draw_toast`).
     fn draw_notice_bar(&mut self, ctx: &egui::Context) {
-        if self.notice.as_ref().is_some_and(|notice| {
-            notice.kind == NoticeKind::Success && notice.since.elapsed() > NOTICE_DURATION
-        }) {
-            self.notice = None;
-        }
-
         let palette = self.look.palette;
         let icons = self.look.icons;
         let missing_login = self.library.missing_shared_login();
@@ -1370,26 +1402,18 @@ impl SimpleRtspViewerApp {
             .show_separator_line(false)
             .show(ctx, |ui| {
                 ui.add_enabled_ui(self.dialog.is_none(), |ui| {
-                    let (kind, text) = match &self.notice {
-                        Some(notice) => (notice.kind, notice.text.as_str()),
-                        None => (
-                            NoticeKind::Error,
-                            "Set the default login so the app can connect to the cameras.",
-                        ),
-                    };
-                    let (fill, icon, icon_color) = match kind {
-                        NoticeKind::Success => (
-                            palette.notice_success,
-                            theme::ICON_SUCCESS,
-                            palette.success_text,
-                        ),
-                        NoticeKind::Error if self.notice.is_none() => {
-                            (palette.notice_info, theme::ICON_INFO, palette.accent)
-                        }
-                        NoticeKind::Error => (
+                    let (text, fill, icon, icon_color) = match &self.notice {
+                        Some(notice) => (
+                            notice.text.as_str(),
                             palette.notice_error,
                             theme::ICON_WARNING,
                             palette.critical_text,
+                        ),
+                        None => (
+                            "Set the default login so the app can connect to the cameras.",
+                            palette.notice_info,
+                            theme::ICON_INFO,
+                            palette.accent,
                         ),
                     };
                     egui::Frame::none()
@@ -1438,10 +1462,59 @@ impl SimpleRtspViewerApp {
         if define_login {
             self.run_command(Command::SharedLogin);
         }
-        if self.notice.is_some() {
-            // So the success message goes away at the right time.
-            ctx.request_repaint_after(Duration::from_millis(500));
-        }
+    }
+
+    /// Toast: a short confirmation popup, centered at the bottom of the window,
+    /// over everything else. It fades in, stays for `TOAST_DURATION` and fades
+    /// out by itself; it does not take clicks, so it never gets in the way of
+    /// the tiles under it.
+    fn draw_toast(&mut self, ctx: &egui::Context) {
+        let Some(toast) = &self.toast else {
+            return;
+        };
+        let Some(opacity) = toast_opacity(toast.since.elapsed()) else {
+            self.toast = None;
+            return;
+        };
+
+        let palette = self.look.palette;
+        let icons = self.look.icons;
+        egui::Area::new(egui::Id::new("simple_rtsp_viewer_toast"))
+            .order(egui::Order::Tooltip)
+            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -(GAP * 3.0)])
+            .interactable(false)
+            .show(ctx, |ui| {
+                // One opacity for everything drawn in the toast (background,
+                // shadow, icon and text).
+                ui.set_opacity(opacity);
+                egui::Frame::none()
+                    .fill(palette.dialog_background)
+                    .stroke(egui::Stroke::new(1.0_f32, palette.control_stroke))
+                    .rounding(8.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: egui::vec2(0.0, 4.0),
+                        blur: 16.0,
+                        spread: 0.0,
+                        color: egui::Color32::from_black_alpha(70),
+                    })
+                    .inner_margin(egui::Margin::symmetric(16.0, 10.0))
+                    .show(ui, |ui| {
+                        ui.set_max_width(TOAST_MAX_WIDTH);
+                        ui.horizontal(|ui| {
+                            if icons {
+                                ui.label(
+                                    egui::RichText::new(theme::ICON_SUCCESS)
+                                        .font(theme::icon_font(16.0))
+                                        .color(palette.success_text),
+                                );
+                            }
+                            ui.label(egui::RichText::new(&toast.text).color(palette.text));
+                        });
+                    });
+            });
+
+        // Keeps the fade animation running while nothing else repaints.
+        ctx.request_repaint_after(Duration::from_millis(16));
     }
 
     /// Open dialog, over the darkened rest of the window.
@@ -1543,6 +1616,7 @@ impl eframe::App for SimpleRtspViewerApp {
         // Last: the grid sees the open dialog and stays inactive in this frame,
         // even if the dialog closes now (e.g. Esc belongs only to the dialog).
         self.draw_dialog(ctx);
+        self.draw_toast(ctx);
 
         // Avoids a continuous repaint busy-loop (which would keep CPU/GPU
         // always busy, against Requirements 7.2/7.3). egui already schedules an
@@ -1708,6 +1782,69 @@ mod tests {
             assert!(!app.statuses.contains_key("a"));
             assert_eq!(app.enlarged, None);
             assert_eq!(app.cameras.len(), 1);
+        });
+    }
+
+    #[test]
+    fn toast_fades_in_stays_solid_then_fades_out_and_ends() {
+        let ms = Duration::from_millis;
+        // Starts invisible and fades in.
+        assert_eq!(toast_opacity(ms(0)), Some(0.0));
+        let half = toast_opacity(TOAST_FADE_IN / 2).unwrap();
+        assert!((half - 0.5).abs() < 1e-3);
+        // Solid in the middle.
+        assert_eq!(toast_opacity(TOAST_DURATION / 2), Some(1.0));
+        // Fades out during the last `TOAST_FADE_OUT`.
+        let fading = toast_opacity(TOAST_DURATION - TOAST_FADE_OUT / 2).unwrap();
+        assert!((fading - 0.5).abs() < 1e-3);
+        // Gone once the duration is over.
+        assert_eq!(toast_opacity(TOAST_DURATION), None);
+        assert_eq!(toast_opacity(TOAST_DURATION + ms(1)), None);
+    }
+
+    #[test]
+    fn toast_opacity_is_always_between_zero_and_one() {
+        let mut elapsed = Duration::ZERO;
+        while elapsed < TOAST_DURATION {
+            let opacity = toast_opacity(elapsed).expect("still on screen");
+            assert!((0.0..=1.0).contains(&opacity), "{opacity} at {elapsed:?}");
+            elapsed += Duration::from_millis(7);
+        }
+    }
+
+    #[test]
+    fn successes_become_toasts_and_errors_stay_in_the_notice_bar() {
+        with_app(vec![], |app| {
+            app.show_notice(NoticeKind::Success, "Reconnecting all cameras.");
+            assert_eq!(
+                app.toast.as_ref().map(|toast| toast.text.as_str()),
+                Some("Reconnecting all cameras.")
+            );
+            assert!(app.notice.is_none());
+
+            app.show_notice(NoticeKind::Error, "The login was not saved.");
+            assert_eq!(
+                app.notice.as_ref().map(|notice| notice.text.as_str()),
+                Some("The login was not saved.")
+            );
+            // The error does not take the toast away.
+            assert!(app.toast.is_some());
+
+            // A new toast replaces the one on screen.
+            app.show_notice(NoticeKind::Success, "Camera added.");
+            assert_eq!(
+                app.toast.as_ref().map(|toast| toast.text.as_str()),
+                Some("Camera added.")
+            );
+        });
+    }
+
+    #[test]
+    fn refresh_shows_a_toast_not_a_notice() {
+        with_app(vec![stored("a", "/main-a", None)], |app| {
+            app.run_command(Command::Refresh);
+            assert!(app.toast.is_some());
+            assert!(app.notice.is_none());
         });
     }
 

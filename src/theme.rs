@@ -68,9 +68,8 @@ pub struct Palette {
     /// Success and error text on the theme background.
     pub success_text: Color32,
     pub critical_text: Color32,
-    /// Backgrounds of the notice bars (InfoBar): info, success and error.
+    /// Backgrounds of the notice bar (InfoBar): info and error.
     pub notice_info: Color32,
-    pub notice_success: Color32,
     pub notice_error: Color32,
 }
 
@@ -96,7 +95,6 @@ impl Palette {
                 success_text: SUCCESS,
                 critical_text: CRITICAL,
                 notice_info: Color32::from_rgb(0x2B, 0x2B, 0x2B),
-                notice_success: Color32::from_rgb(0x39, 0x3D, 0x1B),
                 notice_error: Color32::from_rgb(0x44, 0x27, 0x26),
             }
         } else {
@@ -119,7 +117,6 @@ impl Palette {
                 success_text: Color32::from_rgb(0x0F, 0x7B, 0x0F),
                 critical_text: Color32::from_rgb(0xC4, 0x2B, 0x1C),
                 notice_info: Color32::from_rgb(0xF6, 0xF6, 0xF6),
-                notice_success: Color32::from_rgb(0xDF, 0xF6, 0xDD),
                 notice_error: Color32::from_rgb(0xFD, 0xE7, 0xE9),
             }
         }
