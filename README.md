@@ -8,14 +8,15 @@ Simple desktop viewer for watching multiple RTSP cameras in a grid. The project 
 - local network discovery, testing each camera with the default login;
 - camera logins kept in the Windows Credential Manager, never in a file;
 - import of cameras from a JSON file;
-- simultaneous display of the streams in a responsive grid;
+- a **sidebar** (collapsible to icons) with the actions, the list of cameras with their live status, and, for the enlarged camera, its resolution, sound and a way back to the grid. Nothing floats over the video, so no control can cover another or the picture;
+- simultaneous display of the streams in a responsive grid that picks the number of columns that gives the largest video for the window shape;
 - visual indicators for connected, reconnecting and failed streams;
-- automatic reconnection with progressive backoff when a stream drops, and a **Refresh** button to reconnect every camera;
+- automatic reconnection with progressive backoff when a stream drops, and a **Refresh** action to reconnect every camera;
 - camera reordering by drag and drop;
-- double-click to enlarge a camera (double-click or `Esc` returns to the grid);
-- substream (lower resolution) everywhere by default; the enlarged camera has a **Higher resolution** button to switch to the main stream;
+- double-click a tile, or click a camera in the sidebar, to enlarge it (double-click, `Esc` or **Back to grid** returns);
+- substream (lower resolution) everywhere by default; the enlarged camera has a **Higher resolution** switch in the sidebar to use the main stream;
 - camera sound: the grid is silent, and enlarging a camera plays its audio through the default Windows output device, with mute and volume controls (see [Sound](#sound));
-- frames scaled down to their on-screen size during decoding, keeping the aspect ratio;
+- frames scaled (bicubic) to their exact on-screen size in physical pixels during decoding and drawn 1:1, with borders and text aligned to the pixel grid at any display scaling, for a sharp picture and interface;
 - GPU video decoding (D3D11VA), falling back to the CPU automatically when the GPU does not support the video;
 - Windows 11 look: light/dark theme following the system, Windows accent color, Segoe fonts and Mica backdrop;
 - grid order saved automatically;
@@ -63,14 +64,14 @@ The bundled FFmpeg build is licensed under the GPL v3; its license is installed 
 
 ## Cameras
 
-Cameras are managed from the app's command bar:
+Cameras are managed from the sidebar (the button at its top collapses it to icons; hover an icon for its name):
 
-- **Default login**: username and password used by the cameras (and by the network scan). They are kept in the Windows Credential Manager as a generic credential of the "Simple RTSP Viewer" service.
-- **Scan network**: probes the RTSP port (554 by default) on every address of the local network, limited to 254 addresses per interface, and opens the video paths (`/stream1` and `/stream2` by default) with the default login. Cameras that respond are listed with their IP and resolution, and you choose which ones to add.
 - **Add camera**: address, port, main stream and substream paths, and the login (the default one, one for this camera only, or none). The "Test connection" button checks it before saving.
+- **Scan network**: probes the RTSP port (554 by default) on every address of the local network, limited to 254 addresses per interface, and opens the video paths (`/stream1` and `/stream2` by default) with the default login. Cameras that respond are listed with their IP and resolution, and you choose which ones to add.
 - **Import**: merges the cameras from a JSON file (format below) into the list.
 - **Refresh**: reconnects every camera, without waiting for the reconnection backoff.
-- Right-click a camera to enlarge, edit or remove it.
+- **Default login**: username and password used by the cameras (and by the network scan). They are kept in the Windows Credential Manager as a generic credential of the "Simple RTSP Viewer" service.
+- **Cameras list**: every camera with a status dot (green connected, amber reconnecting, red disconnected), its name and address. Click one to enlarge it (click it again to go back); right-click to edit or remove it. Right-clicking a tile in the grid offers the same.
 
 The list is stored in `%APPDATA%\Simple RTSP Viewer\cameras.json`, without any password, already in grid order.
 
@@ -102,10 +103,10 @@ On the first run, if there is a `cameras.json` in the current folder (the format
 
 The grid never plays sound: the audio packets of every stream are read together with the video but dropped without being decoded, so the cameras in the grid cost nothing for audio. When you enlarge a camera, the app starts decoding the audio of the stream it already has open (the substream or the main one, there is no reconnection), converts it to stereo at the sample rate of the default output device and plays it. Going back to the grid, or enlarging another camera, moves or stops the sound; the output device is paused while no camera is enlarged.
 
-The enlarged camera shows, in its bottom-left corner (only if the stream has audio):
+The sidebar shows, in the card of the enlarged camera (only if the stream has audio):
 
 - a **mute button**, which also stops decoding the audio while muted;
-- a **volume slider**. Half way plays the camera audio at its original level and full volume boosts it by 12 dB, because camera microphones are usually quiet. The mute and volume choices are kept while the app is open, across cameras.
+- a **volume slider**. Half way (marked with a tick) plays the camera audio at its original level and full volume boosts it by 12 dB, because camera microphones are usually quiet. The mute and volume choices are kept while the app is open, across cameras.
 
 Any audio codec the linked FFmpeg can decode is accepted. G.711 A-law (8 kHz, mono, what TP-Link Tapo cameras send) is the one tested, with real camera data; others, such as AAC, go through the same path but were not tested. If the sound output cannot be opened (no output device, for example), the app shows an error once and the cameras stay silent.
 
@@ -136,6 +137,15 @@ $env:RTSP_VIEWER_GPU_DECODE = "0"; .\target\release\simple-rtsp-viewer.exe
 
 ```bash
 cargo test
+```
+
+The interface has layout tests that draw it without a window at several window sizes (down to the 720x480 minimum), display scales (100%, 150%, 200%), themes and numbers of cameras (0 to 64), and fail if any component overlaps another, leaves its area or covers the sidebar. They do not open any camera connection. Two manual benchmarks exist for tuning (they are ignored by default):
+
+```bash
+# cost of each pixel-converter filter (swscale), per frame
+cargo test --release scaler_benchmark -- --ignored --nocapture
+# cost of one frame of the interface
+cargo test --release ui_frame_benchmark -- --ignored --nocapture
 ```
 
 ## License
