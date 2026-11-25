@@ -20,6 +20,7 @@ Simple RTSP Viewer is a Windows desktop app that shows multiple RTSP cameras in 
 - `src/discovery.rs`: LAN camera discovery.
 - `src/credentials.rs`, `src/store.rs`, `src/import.rs`, `src/model.rs`, `src/rtsp_url.rs`: data, persistence and URLs.
 - `setup.ps1`: Windows environment setup and release build.
+- `installer/`: the WiX MSI (`Package.wxs`), the script that builds it (`build-installer.ps1`) and `installer/setup`, the Windows 11 style installer for the current user. `installer/setup` is a crate of its own (not a workspace member): run `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` there too when you change it.
 
 ## Language
 

@@ -52,7 +52,11 @@ cargo build --release
 
 ## Installer
 
-`installer\build-installer.ps1` builds an MSI installer in `dist\` with the executable (C runtime linked statically, so no Visual C++ Redistributable is needed), the FFmpeg DLLs it uses and the license files. The installed executable is `Simple RTSP Viewer.exe`. The MSI installs for all users to `Program Files\Simple RTSP Viewer` by default; the Advanced button of the first page switches to the current user only (`%LocalAppData%\Programs\Simple RTSP Viewer`, no administrator prompt). It closes the running app when it updates, adds a Start menu shortcut, offers to open the app at the end and can be removed from Windows Settings > Apps. It needs [WiX Toolset 5](https://wixtoolset.org) with the UI and Util extensions:
+`installer\build-installer.ps1` builds two installers in `dist\`, both with the executable (C runtime linked statically, so no Visual C++ Redistributable is needed), the FFmpeg DLLs it uses and the license files. The installed executable is `Simple RTSP Viewer.exe`.
+
+`SimpleRtspViewer-<version>-setup.exe` is a Windows 11 style installer (`installer\setup`, a small Rust program with the files compressed inside). It installs for the current user only, to `%LocalAppData%\Programs\Simple RTSP Viewer`, with no administrator rights; it updates in place, replaces an MSI install, and has its own uninstaller in Settings > Apps. It needs the Rust MSVC toolchain to build.
+
+`SimpleRtspViewer-<version>-x64.msi` is the standard installer, for deployment tools. It installs for all users to `Program Files\Simple RTSP Viewer` by default; the Advanced button of the first page switches to the current user only (`%LocalAppData%\Programs\Simple RTSP Viewer`, no administrator prompt). It closes the running app when it updates, adds a Start menu shortcut, offers to open the app at the end and can be removed from Windows Settings > Apps. It needs [WiX Toolset 5](https://wixtoolset.org) with the UI and Util extensions:
 
 ```powershell
 dotnet tool install --global wix --version 5.0.2

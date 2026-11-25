@@ -1,13 +1,15 @@
 <#
 .SYNOPSIS
-    Builds the Simple RTSP Viewer MSI installer.
+    Builds the Simple RTSP Viewer setup and the MSI installer.
 
 .DESCRIPTION
     1. Builds the release executable with the C runtime linked statically, so
        the installed app does not depend on the Visual C++ Redistributable.
     2. Stages the executable (as "Simple RTSP Viewer.exe"), the FFmpeg DLLs
        and the license files.
-    3. Builds dist\SimpleRtspViewer-<version>-x64.msi with the WiX Toolset.
+    3. Builds dist\SimpleRtspViewer-<version>-setup.exe (installer\setup): the
+       Windows 11 style installer for the current user, with the files inside.
+    4. Builds dist\SimpleRtspViewer-<version>-x64.msi with the WiX Toolset.
 
     Requires the same environment as setup.ps1 (FFMPEG_DIR, LIBCLANG_PATH) and
     WiX Toolset 5 with the UI and Util extensions:
@@ -31,6 +33,7 @@ $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches
 $stage = Join-Path $root "target\installer-stage"
 $dist = Join-Path $root "dist"
 $msi = Join-Path $dist "SimpleRtspViewer-$version-x64.msi"
+$setup = Join-Path $dist "SimpleRtspViewer-$version-setup.exe"
 
 Write-Host "==> Building release $version (static C runtime)" -ForegroundColor Cyan
 $env:RUSTFLAGS = "-C target-feature=+crt-static"
@@ -52,6 +55,12 @@ Copy-Item "assets\icon.ico" $stage
 Copy-Item "LICENSE" "$stage\licenses\LICENSE.txt"
 Copy-Item (Join-Path $FfmpegDir "LICENSE.txt") "$stage\licenses\FFmpeg-LICENSE.txt"
 
+# The setup embeds the same files as the MSI, except what only the MSI uses.
+$payload = Join-Path $root "target\setup-payload"
+if (Test-Path $payload) { Remove-Item $payload -Recurse -Force }
+Copy-Item $stage $payload -Recurse
+Remove-Item "$payload\icon.ico"
+
 # License page of the installer (RTF): the app license plus a note on FFmpeg.
 $escape = { param($s) $s.Replace('\', '\\').Replace('{', '\{').Replace('}', '\}') }
 $lines = (Get-Content LICENSE) + @(
@@ -63,10 +72,25 @@ $lines = (Get-Content LICENSE) + @(
 $body = ($lines | ForEach-Object { (& $escape $_) + "\par" }) -join "`n"
 "{\rtf1\ansi\deff0{\fonttbl{\f0 Segoe UI;}}\fs18`n$body`n}" | Set-Content "$stage\license.rtf" -Encoding ascii
 
+Write-Host "==> Building the setup (embeds the files)" -ForegroundColor Cyan
+New-Item -ItemType Directory -Path $dist -Force | Out-Null
+$env:SETUP_PAYLOAD_DIR = $payload
+Push-Location "installer\setup"
+try {
+    cargo build --release
+    if ($LASTEXITCODE -ne 0) { throw "setup build failed." }
+} finally {
+    Pop-Location
+    Remove-Item Env:\SETUP_PAYLOAD_DIR
+}
+Copy-Item "installer\setup\target\release\simple-rtsp-viewer-setup.exe" $setup -Force
+
 Write-Host "==> Building MSI" -ForegroundColor Cyan
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
 wix build "installer\Package.wxs" -arch x64 -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext `
     -d "Version=$version" -d "StageDir=$stage" -o $msi
 if ($LASTEXITCODE -ne 0) { throw "wix build failed." }
 
-Write-Host "==> $msi ($([math]::Round((Get-Item $msi).Length / 1MB, 1)) MB)" -ForegroundColor Green
+foreach ($file in $setup, $msi) {
+    Write-Host "==> $file ($([math]::Round((Get-Item $file).Length / 1MB, 1)) MB)" -ForegroundColor Green
+}
