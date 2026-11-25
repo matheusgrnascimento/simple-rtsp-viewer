@@ -52,11 +52,12 @@ cargo build --release
 
 ## Installer
 
-`installer\build-installer.ps1` builds an MSI installer in `dist\` with the executable (C runtime linked statically, so no Visual C++ Redistributable is needed), the FFmpeg DLLs it uses and the license files. The MSI installs to `Program Files\Simple RTSP Viewer`, adds a Start menu shortcut and can be removed from Windows Settings > Apps. It needs [WiX Toolset 5](https://wixtoolset.org) with the UI extension:
+`installer\build-installer.ps1` builds an MSI installer in `dist\` with the executable (C runtime linked statically, so no Visual C++ Redistributable is needed), the FFmpeg DLLs it uses and the license files. The installed executable is `Simple RTSP Viewer.exe`. The MSI installs for all users to `Program Files\Simple RTSP Viewer` by default; the Advanced button of the first page switches to the current user only (`%LocalAppData%\Programs\Simple RTSP Viewer`, no administrator prompt). It closes the running app when it updates, adds a Start menu shortcut, offers to open the app at the end and can be removed from Windows Settings > Apps. It needs [WiX Toolset 5](https://wixtoolset.org) with the UI and Util extensions:
 
 ```powershell
 dotnet tool install --global wix --version 5.0.2
 wix extension add -g WixToolset.UI.wixext/5.0.2
+wix extension add -g WixToolset.Util.wixext/5.0.2
 powershell -ExecutionPolicy Bypass -File .\installer\build-installer.ps1
 ```
 

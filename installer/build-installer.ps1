@@ -5,13 +5,15 @@
 .DESCRIPTION
     1. Builds the release executable with the C runtime linked statically, so
        the installed app does not depend on the Visual C++ Redistributable.
-    2. Stages the executable, the FFmpeg DLLs and the license files.
+    2. Stages the executable (as "Simple RTSP Viewer.exe"), the FFmpeg DLLs
+       and the license files.
     3. Builds dist\SimpleRtspViewer-<version>-x64.msi with the WiX Toolset.
 
     Requires the same environment as setup.ps1 (FFMPEG_DIR, LIBCLANG_PATH) and
-    WiX Toolset 5 with the UI extension:
+    WiX Toolset 5 with the UI and Util extensions:
         dotnet tool install --global wix --version 5.0.2
         wix extension add -g WixToolset.UI.wixext/5.0.2
+        wix extension add -g WixToolset.Util.wixext/5.0.2
 
 .PARAMETER FfmpegDir
     FFmpeg folder with bin\*.dll and LICENSE.txt. Default: $env:FFMPEG_DIR or C:\ffmpeg
@@ -38,7 +40,7 @@ if ($LASTEXITCODE -ne 0) { throw "cargo build failed." }
 Write-Host "==> Staging files" -ForegroundColor Cyan
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Path "$stage\licenses" -Force | Out-Null
-Copy-Item "target\release\simple-rtsp-viewer.exe" $stage
+Copy-Item "target\release\simple-rtsp-viewer.exe" "$stage\Simple RTSP Viewer.exe"
 # Only the libraries the executable loads, directly or through each other
 # (avdevice, avfilter and postproc are not used).
 foreach ($lib in "avcodec", "avformat", "avutil", "swresample", "swscale") {
@@ -63,7 +65,7 @@ $body = ($lines | ForEach-Object { (& $escape $_) + "\par" }) -join "`n"
 
 Write-Host "==> Building MSI" -ForegroundColor Cyan
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
-wix build "installer\Package.wxs" -arch x64 -ext WixToolset.UI.wixext `
+wix build "installer\Package.wxs" -arch x64 -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext `
     -d "Version=$version" -d "StageDir=$stage" -o $msi
 if ($LASTEXITCODE -ne 0) { throw "wix build failed." }
 
