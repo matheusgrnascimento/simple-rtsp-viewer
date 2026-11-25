@@ -1,6 +1,6 @@
 [package]
 name = "simple-rtsp-viewer"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Windows desktop viewer for multiple RTSP cameras in a grid, with network discovery and GPU decoding"
 license = "MIT"
