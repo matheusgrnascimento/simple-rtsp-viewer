@@ -15,6 +15,7 @@ Simple desktop viewer for watching multiple RTSP cameras in a grid. The project 
 - camera reordering by drag and drop;
 - double-click a tile, or click a camera in the sidebar, to enlarge it (double-click, `Esc` or **Back to grid** returns);
 - press 1 to 9 to enlarge the camera at that position; the same number again returns to the grid, another number switches to that camera;
+- scroll over the enlarged camera to zoom in and out around the pointer (the zoom resets when you leave the camera or switch to another);
 - substream (lower resolution) everywhere by default; the enlarged camera has a **Higher resolution** switch in the sidebar to use the main stream;
 - camera sound: the grid is silent, and enlarging a camera plays its audio through the default Windows output device, with mute and volume controls (see [Sound](#sound));
 - frames scaled (bicubic) to their exact on-screen size in physical pixels during decoding and drawn 1:1, with borders and text aligned to the pixel grid at any display scaling, for a sharp picture and interface;
