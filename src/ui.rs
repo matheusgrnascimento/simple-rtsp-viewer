@@ -687,6 +687,47 @@ impl SimpleRtspViewerApp {
         }
     }
 
+    /// Enlarges the camera at index (0-based, in grid order). Pressing the
+    /// number of the camera that is already enlarged goes back to the grid.
+    /// Does nothing when there is no camera at that position.
+    fn toggle_enlarged_at(&mut self, index: usize) {
+        let Some(id) = self.cameras.get(index).map(|camera| camera.id.clone()) else {
+            return;
+        };
+        if self.enlarged.as_deref() == Some(id.as_str()) {
+            self.set_enlarged(None);
+        } else {
+            self.set_enlarged(Some(id));
+        }
+    }
+
+    /// Keys 1 to 9 open the camera at that position in the grid. Ignored
+    /// while a dialog is open or a text field has focus.
+    fn handle_number_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.dialog.is_some() || ctx.wants_keyboard_input() {
+            return;
+        }
+        const KEYS: [egui::Key; 9] = [
+            egui::Key::Num1,
+            egui::Key::Num2,
+            egui::Key::Num3,
+            egui::Key::Num4,
+            egui::Key::Num5,
+            egui::Key::Num6,
+            egui::Key::Num7,
+            egui::Key::Num8,
+            egui::Key::Num9,
+        ];
+        let pressed = ctx.input(|input| {
+            if input.modifiers.any() {
+                return None;
+            }
+            KEYS.iter().position(|key| input.key_pressed(*key))
+        });
+        if let Some(index) = pressed {
+            self.toggle_enlarged_at(index);
+        }
+    }
     /// Switches the enlarged camera between its substream and its main stream.
     fn set_high_resolution(&mut self, high: bool) {
         if self.high_resolution != high {
@@ -1904,6 +1945,7 @@ impl SimpleRtspViewerApp {
     /// everything.
     fn ui(&mut self, ctx: &egui::Context) -> bool {
         let received_update = self.drain_camera_events(ctx);
+        self.handle_number_shortcuts(ctx);
         self.draw_sidebar(ctx);
         self.draw_notice_bar(ctx);
         self.draw_content(ctx);
@@ -2071,6 +2113,23 @@ mod tests {
         });
     }
 
+    #[test]
+    fn number_positions_open_switch_and_close_the_enlarged_camera() {
+        let cameras = vec![stored("a", "/main-a", None), stored("b", "/main-b", None)];
+        with_app(cameras, |app| {
+            app.toggle_enlarged_at(0);
+            assert_eq!(app.enlarged_index(), Some(0));
+            // Another number goes straight to that camera.
+            app.toggle_enlarged_at(1);
+            assert_eq!(app.enlarged_index(), Some(1));
+            // The same number again goes back to the grid.
+            app.toggle_enlarged_at(1);
+            assert_eq!(app.enlarged_index(), None);
+            // A position without a camera does nothing.
+            app.toggle_enlarged_at(5);
+            assert_eq!(app.enlarged_index(), None);
+        });
+    }
     #[test]
     fn library_changes_open_close_and_switch_streams() {
         with_app(vec![stored("a", "/main-a", None)], |app| {
