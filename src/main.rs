@@ -21,6 +21,7 @@ mod streaming;
 mod theme;
 mod ui;
 mod widgets;
+mod zoom;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

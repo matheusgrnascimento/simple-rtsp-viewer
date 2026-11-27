@@ -31,6 +31,7 @@ use crate::store::{self, CameraLibrary};
 use crate::streaming::{StreamChannels, StreamManagerHandle};
 use crate::theme;
 use crate::widgets;
+use crate::zoom::{self, Zoom};
 
 /// How long a toast (the short confirmation popup) stays on screen, counting
 /// its fade in and fade out. Error messages are not toasts: they stay in the
@@ -163,6 +164,8 @@ struct TileState {
     drop_target: bool,
     /// It is the tile being dragged: stays in place, dimmed.
     dimmed: bool,
+    /// Part of the picture shown, in normalized texture coordinates.
+    view: egui::Rect,
 }
 
 /// Rectangles of the overlays drawn on a tile (`None` when not drawn).
@@ -367,6 +370,8 @@ pub struct SimpleRtspViewerApp {
     /// The enlarged camera shows its main stream (higher resolution) instead of
     /// the substream. Turned off whenever the enlarged camera changes.
     high_resolution: bool,
+    /// Zoom of the enlarged camera. Reset whenever the enlarged camera changes.
+    zoom: Zoom,
     /// Handle to the `Stream_Manager`, used to open and close streams.
     stream_manager_handle: StreamManagerHandle,
     /// Camera library (stored list and logins), source of `cameras`.
@@ -436,6 +441,7 @@ impl SimpleRtspViewerApp {
             probe: Probe::default(),
             enlarged: None,
             enlarged_since: None,
+            zoom: Zoom::default(),
             high_resolution: false,
             stream_manager_handle,
             library,
@@ -682,6 +688,7 @@ impl SimpleRtspViewerApp {
             self.enlarged_since = key.as_ref().map(|_| Instant::now());
             self.enlarged = key;
             self.high_resolution = false;
+            self.zoom = Zoom::default();
             self.sync_streams();
             self.sync_audio();
         }
@@ -1024,6 +1031,7 @@ impl SimpleRtspViewerApp {
                 hovered: response.hovered(),
                 drop_target,
                 dimmed: is_dragged,
+                view: zoom::full_view(),
             },
         );
         probe!(self.probe, format!("tile:{index}"), rect);
@@ -1129,6 +1137,7 @@ impl SimpleRtspViewerApp {
             .id()
             .with(("enlarged_tile", self.cameras[index].id.as_str()));
         let response = ui.interact(rect, id, egui::Sense::click());
+        self.zoom_with_scroll(ui, index, rect, &response);
 
         let overlays = self.paint_camera(
             ui,
@@ -1138,6 +1147,7 @@ impl SimpleRtspViewerApp {
                 hovered: false,
                 drop_target: false,
                 dimmed: false,
+                view: self.zoom.view(),
             },
         );
         let hint = self.paint_enlarged_hint(ui, rect, &[overlays.status, overlays.name]);
@@ -1159,6 +1169,29 @@ impl SimpleRtspViewerApp {
         if response.double_clicked() || escape {
             self.set_enlarged(None);
         }
+    }
+
+    /// Scrolling over the enlarged picture zooms around the pointer. Does
+    /// nothing while a dialog is open.
+    fn zoom_with_scroll(
+        &mut self,
+        ui: &egui::Ui,
+        index: usize,
+        rect: egui::Rect,
+        response: &egui::Response,
+    ) {
+        if !ui.is_enabled() || !response.hovered() {
+            return;
+        }
+        let Some(texture) = self.textures.get(&self.cameras[index].id) else {
+            return;
+        };
+        let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) else {
+            return;
+        };
+        let scroll_y = ui.input(|input| input.smooth_scroll_delta.y);
+        let video = pixel::video_rect(rect, texture.size_vec2(), ui.ctx().pixels_per_point());
+        self.zoom.scroll(scroll_y, pointer, video);
     }
 
     /// Hint on how to go back to the grid, in the top-right corner of the
@@ -1344,7 +1377,7 @@ impl SimpleRtspViewerApp {
                 egui::Color32::WHITE,
             );
             shape.fill_texture_id = texture.id();
-            shape.uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            shape.uv = state.view;
             painter.add(shape);
         }
 
@@ -2130,6 +2163,22 @@ mod tests {
             assert_eq!(app.enlarged_index(), None);
         });
     }
+    #[test]
+    fn zoom_is_reset_when_the_enlarged_camera_changes() {
+        let cameras = vec![stored("a", "/main-a", None), stored("b", "/main-b", None)];
+        with_app(cameras, |app| {
+            let video = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 200.0));
+            app.set_enlarged(Some("a".to_string()));
+            app.zoom.scroll(300.0, egui::pos2(100.0, 50.0), video);
+            assert!(!app.zoom.is_reset());
+            app.set_enlarged(Some("b".to_string()));
+            assert!(app.zoom.is_reset());
+            app.zoom.scroll(300.0, egui::pos2(100.0, 50.0), video);
+            app.set_enlarged(None);
+            assert!(app.zoom.is_reset());
+        });
+    }
+
     #[test]
     fn library_changes_open_close_and_switch_streams() {
         with_app(vec![stored("a", "/main-a", None)], |app| {
